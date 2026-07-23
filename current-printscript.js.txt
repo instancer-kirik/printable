@@ -1024,7 +1024,7 @@
       zpl += `^FO10,${priceY}^FB${fieldW},1,0,C,0^FD$${formattedPrice}^FS\n`;
 
       if (upc && upc.length >= 8) {
-        const barcodeX = Math.max(12, Math.round((widthDots - estBarcodeWidth) / 2));
+        const barcodeX = Math.max(0, Math.round((widthDots - estBarcodeWidth) / 2)) + 10;
         zpl += `^CF0,${HRI_FONT}\n`;
         // ^BY must precede ^FO — placed after ^FO the printer ignores it and uses its stored default module width.
         zpl += `^BY${barcodeModuleWidth}\n`;
@@ -1117,7 +1117,7 @@
       zpl += `^FO10,${priceYc}^FB${fieldWc},1,0,C,0^FD$${formattedPrice}^FS\n`;
 
       if (upc && upc.length >= 8) {
-        const barcodeX = Math.max(12, Math.round((widthDots - estBarcodeWidth) / 2));
+        const barcodeX = Math.max(0, Math.round((widthDots - estBarcodeWidth) / 2)) + 10;
         zpl += `^CF0,${HRI_FONT}\n`;
         // ^BY must precede ^FO — placed after ^FO the printer ignores it and uses its stored default module width.
         zpl += `^BY${barcodeModuleWidth}\n`;
