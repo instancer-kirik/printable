@@ -372,12 +372,8 @@
                         <button id="pm-toggle-autoprint" title="Toggle auto-print on scan">Auto-Print: ${this.autoPrintEnabled ? "ON" : "OFF"}</button>
                     </div>
                     <div class="button-group">
-                        <button id="pm-print-config-label" title="Print the Zebra printer's built-in configuration/status label (shows real DPI)">Print Config Label</button>
-                        <button id="pm-select-printer" title="Choose which Browser Print printer to send labels to">Select Printer</button>
-                    </div>
-                    <div class="button-group">
                         <button id="pm-about" title="About this tool and setup instructions">About</button>
-                        <button id="pm-toggle-panel" title="Minimize panel">Minimize</button>
+                        <button id="pm-select-printer" title="Choose which Browser Print printer to send labels to">Select Printer</button>
                     </div>
                 </div>
             `;
@@ -480,12 +476,6 @@
 
       // Print printer configuration/status label (shows real DPI, calibration, firmware, etc.)
       document
-        .getElementById("pm-print-config-label")
-        .addEventListener("click", () => {
-          this.printConfigLabel();
-        });
-
-      document
         .getElementById("pm-select-printer")
         .addEventListener("click", () => {
           this.showPrinterSelector();
@@ -495,13 +485,6 @@
       document.getElementById("pm-about").addEventListener("click", () => {
         this.showAbout();
       });
-
-      // Toggle panel
-      document
-        .getElementById("pm-toggle-panel")
-        .addEventListener("click", () => {
-          this.togglePanel();
-        });
 
       // Minimize button
       document
@@ -2149,6 +2132,7 @@
 
       const modal = document.createElement("div");
       modal.id = "pm-about-modal";
+      modal.style.cssText = "position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:99999;display:flex;align-items:center;justify-content:center;";
       modal.innerHTML = `
         <div id="pm-about-content">
           <button class="about-close-btn">&times;</button>
@@ -2190,23 +2174,12 @@
 
       document.body.appendChild(modal);
 
-      // Show modal
-      setTimeout(() => {
-        modal.classList.add("show");
-      }, 10);
-
       // Close button event
-      modal.querySelector(".about-close-btn").addEventListener("click", () => {
-        modal.classList.remove("show");
-        setTimeout(() => modal.remove(), 300);
-      });
+      modal.querySelector(".about-close-btn").addEventListener("click", () => modal.remove());
 
       // Click outside to close
       modal.addEventListener("click", (e) => {
-        if (e.target === modal) {
-          modal.classList.remove("show");
-          setTimeout(() => modal.remove(), 300);
-        }
+        if (e.target === modal) modal.remove();
       });
     }
   }
