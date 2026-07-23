@@ -77,6 +77,7 @@
         storeNameFontDots: 26,  // font size for store name (VDG) header
         barcodeModuleWidth: 1,   // ^BY module width — integers only (ZPL rounds decimals); 1 fits better on 1.5" label
         barcodeHeightDots: 40,  // barcode bar height in dots (not counting HRI text below)
+        barcodeXOffset: 0,      // manual horizontal nudge in dots (+ = right, − = left)
         // --- AI Pricing ---
         pricingFactor: 0.85,    // fraction of market high price to suggest (e.g. 0.85 = 15% below retail)
       };
@@ -1059,7 +1060,7 @@
       zpl += `^FO10,${priceY}^FB${fieldW},1,0,C,0^FD$${formattedPrice}^FS\n`;
 
       if (upc && upc.length >= 8) {
-        const barcodeX = Math.max(0, Math.round((widthDots - estBarcodeWidth) / 2)) + 5;
+        const barcodeX = Math.max(0, Math.round((widthDots - estBarcodeWidth) / 2) + (this.printSettings.barcodeXOffset ?? 0));
         zpl += `^CF0,${HRI_FONT}\n`;
         // ^BY must precede ^FO — placed after ^FO the printer ignores it and uses its stored default module width.
         zpl += `^BY${barcodeModuleWidth}\n`;
@@ -1152,7 +1153,7 @@
       zpl += `^FO10,${priceYc}^FB${fieldWc},1,0,C,0^FD$${formattedPrice}^FS\n`;
 
       if (upc && upc.length >= 8) {
-        const barcodeX = Math.max(0, Math.round((widthDots - estBarcodeWidth) / 2)) + 5;
+        const barcodeX = Math.max(0, Math.round((widthDots - estBarcodeWidth) / 2) + (this.printSettings.barcodeXOffset ?? 0));
         zpl += `^CF0,${HRI_FONT}\n`;
         // ^BY must precede ^FO — placed after ^FO the printer ignores it and uses its stored default module width.
         zpl += `^BY${barcodeModuleWidth}\n`;
@@ -1274,6 +1275,10 @@
             </label>
             <label>Bar Height:
               <input type="number" id="barcode-height-dots" value="${s.barcodeHeightDots ?? 40}" min="10" max="200" /> dots
+            </label>
+            <label>X Offset:
+              <input type="number" id="barcode-x-offset" value="${s.barcodeXOffset ?? 0}" min="-200" max="200" step="1" /> dots
+              <span style="color:#888;font-size:12px;margin-left:6px">+ shifts right, − shifts left. Tune until centered.</span>
             </label>
           </div>
           <div class="settings-buttons">
@@ -1413,6 +1418,7 @@
         storeName:           modal.querySelector("#label-store-name").value.trim(),
         barcodeModuleWidth:  modal.querySelector("#barcode-module-width").value,
         barcodeHeightDots:   modal.querySelector("#barcode-height-dots").value,
+        barcodeXOffset:      modal.querySelector("#barcode-x-offset").value,
       };
 
       const productData = this.getCurrentProductData();
@@ -1524,6 +1530,7 @@
         storeName:           modal.querySelector("#label-store-name").value.trim(),
         barcodeModuleWidth:  modal.querySelector("#barcode-module-width").value,
         barcodeHeightDots:   modal.querySelector("#barcode-height-dots").value,
+        barcodeXOffset:      modal.querySelector("#barcode-x-offset").value,
       };
 
       const productData = this.getCurrentProductData() || {
@@ -1562,6 +1569,7 @@
       modal.querySelector("#label-store-name").value        = d.storeName;
       modal.querySelector("#barcode-module-width").value   = d.barcodeModuleWidth;
       modal.querySelector("#barcode-height-dots").value    = d.barcodeHeightDots;
+      modal.querySelector("#barcode-x-offset").value       = d.barcodeXOffset ?? 0;
       modal.querySelector("#pricing-factor").value         = (d.pricingFactor ?? 0.85).toFixed(2);
       this.updateStatus("Settings reset to default");
     }
@@ -1580,12 +1588,13 @@
       const storeName          = modal.querySelector("#label-store-name").value.trim();
       const barcodeModuleWidth = parseFloat(modal.querySelector("#barcode-module-width").value);
       const barcodeHeightDots  = parseInt(modal.querySelector("#barcode-height-dots").value, 10);
+      const barcodeXOffset     = parseInt(modal.querySelector("#barcode-x-offset").value, 10) || 0;
       const pricingFactor      = parseFloat(modal.querySelector("#pricing-factor").value) || 0.85;
 
       this.printSettings = Object.assign({}, this.printSettings, {
         dpi, widthIn, heightIn, storeNameFontDots, nameFontDots, priceFontDots,
         labelShift, labelTop, darkness, printSpeed, storeName,
-        barcodeModuleWidth, barcodeHeightDots, pricingFactor,
+        barcodeModuleWidth, barcodeHeightDots, barcodeXOffset, pricingFactor,
       });
 
       this.savePrintSettingsToStorage();
