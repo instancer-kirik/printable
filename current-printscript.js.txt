@@ -1059,7 +1059,7 @@
       zpl += `^FO10,${priceY}^FB${fieldW},1,0,C,0^FD$${formattedPrice}^FS\n`;
 
       if (upc && upc.length >= 8) {
-        const barcodeX = Math.max(0, Math.round((widthDots - estBarcodeWidth) / 2)) + 10;
+        const barcodeX = Math.max(0, Math.round((widthDots - estBarcodeWidth) / 2)) + 25;
         zpl += `^CF0,${HRI_FONT}\n`;
         // ^BY must precede ^FO — placed after ^FO the printer ignores it and uses its stored default module width.
         zpl += `^BY${barcodeModuleWidth}\n`;
@@ -1152,7 +1152,7 @@
       zpl += `^FO10,${priceYc}^FB${fieldWc},1,0,C,0^FD$${formattedPrice}^FS\n`;
 
       if (upc && upc.length >= 8) {
-        const barcodeX = Math.max(0, Math.round((widthDots - estBarcodeWidth) / 2)) + 10;
+        const barcodeX = Math.max(0, Math.round((widthDots - estBarcodeWidth) / 2)) + 25;
         zpl += `^CF0,${HRI_FONT}\n`;
         // ^BY must precede ^FO — placed after ^FO the printer ignores it and uses its stored default module width.
         zpl += `^BY${barcodeModuleWidth}\n`;
@@ -2174,7 +2174,7 @@
           return `<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #eee;">
             <span style="flex:1;font-family:monospace;font-size:13px;">${m.upc}</span>
             <span style="font-size:11px;color:#999;white-space:nowrap;">${ts}</span>
-            <button data-lookup="${m.upc}" style="font-size:11px;padding:3px 8px;cursor:pointer;">Lookup</button>
+            <button data-lookup="${m.upc}" style="font-size:11px;padding:3px 8px;cursor:pointer;">Search</button>
             <button data-remove="${i}" style="font-size:11px;padding:3px 8px;cursor:pointer;color:#c0392b;">✕</button>
           </div>`;
         }).join("");
@@ -2205,8 +2205,7 @@
 
       modal.addEventListener("click", e => {
         if (e.target.dataset.lookup) {
-          modal.remove();
-          this.showProductResearchModal(e.target.dataset.lookup);
+          window.open(`https://www.google.com/search?q=${encodeURIComponent(e.target.dataset.lookup)}`, '_blank');
         }
         if (e.target.dataset.remove !== undefined) {
           const idx = parseInt(e.target.dataset.remove, 10);
