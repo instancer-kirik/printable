@@ -981,11 +981,12 @@
       // Always send ^LS and ^LT so our setting is authoritative every job.
       // labelShift compensates for physical media-to-printhead offset (+ shifts print right).
       const ls = this.printSettings.labelShift ?? 0;
+      // ^LH must come before ^LS — on many firmware versions ^LH resets the label shift, cancelling ^LS.
+      zpl += "^LH0,0\n"; // Set label home position
       zpl += `^LS${ls}\n`;
       if (this.printSettings.labelTop) zpl += `^LT${this.printSettings.labelTop}\n`;
       // ^PW must cover widthDots + any positive ^LS shift, otherwise ^LS clips the right edge of centered content.
       zpl += "^PW" + (widthDots + Math.max(0, ls)) + "\n"; // Print width in dots
-      zpl += "^LH0,0\n"; // Set label home position
       zpl += "^LL" + heightDots + "\n"; // Set label length in dots
 
       // Optional store logo
@@ -1042,13 +1043,15 @@
       if (upc && upc.length >= 8) {
         const barcodeX = Math.max(0, Math.round((widthDots - estBarcodeWidth) / 2));
         zpl += `^CF0,${HRI_FONT}\n`;
+        // ^BY must precede ^FO — placed after ^FO the printer ignores it and uses its stored default module width.
+        zpl += `^BY${barcodeModuleWidth}\n`;
         if (isUpcA) {
           // ^BU expects 11 digits — printer calculates and appends the 12th (check digit)
           // Sending all 12 digits with e=N produces a garbled barcode; this is the correct form
-          zpl += `^FO${barcodeX},${barcodeY}^BY${barcodeModuleWidth}^BUN,${barcodeHeight},Y,N,Y^FD${upcNorm.substring(0, 11)}^FS\n`;
+          zpl += `^FO${barcodeX},${barcodeY}^BUN,${barcodeHeight},Y,N,Y^FD${upcNorm.substring(0, 11)}^FS\n`;
         } else {
           // Code 128 for non-UPC-A (EAN-13, UPC-E, etc.)
-          zpl += `^FO${barcodeX},${barcodeY}^BY${barcodeModuleWidth}^BCN,${barcodeHeight},Y,N,N^FD${upcNorm}^FS\n`;
+          zpl += `^FO${barcodeX},${barcodeY}^BCN,${barcodeHeight},Y,N,N^FD${upcNorm}^FS\n`;
         }
       }
 
@@ -1079,11 +1082,12 @@
       zpl += `^PR${settings.printSpeed ?? this.printSettings.printSpeed ?? 4}\n`;
       const ls = settings.labelShift ?? this.printSettings.labelShift ?? 0;
       const lt = settings.labelTop   ?? this.printSettings.labelTop   ?? 0;
+      // ^LH must come before ^LS — on many firmware versions ^LH resets the label shift, cancelling ^LS.
+      zpl += "^LH0,0\n";
       zpl += `^LS${ls}\n`;
       if (lt) zpl += `^LT${lt}\n`;
       // ^PW must cover widthDots + any positive ^LS shift, otherwise ^LS clips the right edge of centered content.
       zpl += "^PW" + (widthDots + Math.max(0, ls)) + "\n";
-      zpl += "^LH0,0\n";
       zpl += "^LL" + heightDots + "\n";
 
       zpl += this.getLogoZPL();
@@ -1132,10 +1136,12 @@
       if (upc && upc.length >= 8) {
         const barcodeX = Math.max(0, Math.round((widthDots - estBarcodeWidth) / 2));
         zpl += `^CF0,${HRI_FONT}\n`;
+        // ^BY must precede ^FO — placed after ^FO the printer ignores it and uses its stored default module width.
+        zpl += `^BY${barcodeModuleWidth}\n`;
         if (isUpcA) {
-          zpl += `^FO${barcodeX},${barcodeY}^BY${barcodeModuleWidth}^BUN,${barcodeHeight},Y,N,Y^FD${upcNorm.substring(0, 11)}^FS\n`;
+          zpl += `^FO${barcodeX},${barcodeY}^BUN,${barcodeHeight},Y,N,Y^FD${upcNorm.substring(0, 11)}^FS\n`;
         } else {
-          zpl += `^FO${barcodeX},${barcodeY}^BY${barcodeModuleWidth}^BCN,${barcodeHeight},Y,N,N^FD${upcNorm}^FS\n`;
+          zpl += `^FO${barcodeX},${barcodeY}^BCN,${barcodeHeight},Y,N,N^FD${upcNorm}^FS\n`;
         }
       }
 
