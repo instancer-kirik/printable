@@ -980,9 +980,11 @@
       zpl += `^PR${this.printSettings.printSpeed ?? 4}\n`;  // Print speed
       // Always send ^LS and ^LT so our setting is authoritative every job.
       // labelShift compensates for physical media-to-printhead offset (+ shifts print right).
-      zpl += `^LS${this.printSettings.labelShift ?? 0}\n`;
+      const ls = this.printSettings.labelShift ?? 0;
+      zpl += `^LS${ls}\n`;
       if (this.printSettings.labelTop) zpl += `^LT${this.printSettings.labelTop}\n`;
-      zpl += "^PW" + widthDots + "\n"; // Print width in dots
+      // ^PW must cover widthDots + any positive ^LS shift, otherwise ^LS clips the right edge of centered content.
+      zpl += "^PW" + (widthDots + Math.max(0, ls)) + "\n"; // Print width in dots
       zpl += "^LH0,0\n"; // Set label home position
       zpl += "^LL" + heightDots + "\n"; // Set label length in dots
 
@@ -1079,7 +1081,8 @@
       const lt = settings.labelTop   ?? this.printSettings.labelTop   ?? 0;
       zpl += `^LS${ls}\n`;
       if (lt) zpl += `^LT${lt}\n`;
-      zpl += "^PW" + widthDots + "\n";
+      // ^PW must cover widthDots + any positive ^LS shift, otherwise ^LS clips the right edge of centered content.
+      zpl += "^PW" + (widthDots + Math.max(0, ls)) + "\n";
       zpl += "^LH0,0\n";
       zpl += "^LL" + heightDots + "\n";
 
