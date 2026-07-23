@@ -44,6 +44,7 @@
       }
 
       this.printSettings = this.loadPrintSettings();
+      this.missedItems = this.loadMissedItems();
     }
 
     async init() {
@@ -91,6 +92,31 @@
         log("Could not load print settings, using defaults:", error);
       }
       return this.defaultPrintSettings();
+    }
+
+    loadMissedItems() {
+      try {
+        const saved = localStorage.getItem("pm-missed-items");
+        return saved ? JSON.parse(saved) : [];
+      } catch { return []; }
+    }
+
+    saveMissedItems() {
+      try {
+        localStorage.setItem("pm-missed-items", JSON.stringify(this.missedItems));
+      } catch (e) { log("Could not save missed items:", e); }
+    }
+
+    addMissedItem(upc) {
+      if (this.missedItems.some(m => m.upc === upc)) return; // no duplicates
+      this.missedItems.push({ upc, timestamp: Date.now() });
+      this.saveMissedItems();
+      this.updateMissedBadge();
+    }
+
+    updateMissedBadge() {
+      const btn = document.getElementById("pm-missed-items");
+      if (btn) btn.textContent = `Missed (${this.missedItems.length})`;
     }
 
     savePrintSettingsToStorage() {
@@ -375,6 +401,9 @@
                         <button id="pm-about" title="About this tool and setup instructions">About</button>
                         <button id="pm-select-printer" title="Choose which Browser Print printer to send labels to">Select Printer</button>
                     </div>
+                    <div class="button-group">
+                        <button id="pm-missed-items" title="Review items not found in system">Missed (0)</button>
+                    </div>
                 </div>
             `;
 
@@ -485,6 +514,12 @@
       document.getElementById("pm-about").addEventListener("click", () => {
         this.showAbout();
       });
+
+      // Missed items
+      document.getElementById("pm-missed-items").addEventListener("click", () => {
+        this.showMissedItems();
+      });
+      this.updateMissedBadge();
 
       // Minimize button
       document
@@ -1781,9 +1816,9 @@
           } else {
             this.lastProductData = null;
             if (this.isProductNotFound()) {
-              log(`🔍 Out-of-system item: ${upcValue} — showing research modal`);
-              this.updateStatus(`⚠️ Not in system: ${upcValue}`);
-              this.showProductResearchModal(upcValue);
+              this.addMissedItem(upcValue);
+              log(`🔍 Out-of-system item: ${upcValue} — added to missed list`);
+              this.updateStatus(`⚠️ Not in system — added to missed list (${this.missedItems.length})`);
             } else {
               this.updateStatus(`❌ No data for UPC: ${upcValue}`);
               log(`❌ No data found for UPC: ${upcValue}, auto-print will be skipped`);
@@ -2121,6 +2156,66 @@
         log("Printer test failed:", error);
         await this.checkPrintCapabilities();
       }
+    }
+
+    showMissedItems() {
+      const existing = document.getElementById("pm-missed-modal");
+      if (existing) { existing.remove(); return; }
+
+      const modal = document.createElement("div");
+      modal.id = "pm-missed-modal";
+      modal.style.cssText = "position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.5);z-index:99999;display:flex;align-items:center;justify-content:center;";
+
+      const renderRows = () => {
+        if (!this.missedItems.length) return `<p style="color:#888;text-align:center;">No missed items.</p>`;
+        return this.missedItems.map((m, i) => {
+          const d = new Date(m.timestamp);
+          const ts = d.toLocaleDateString() + " " + d.toLocaleTimeString([], {hour:"2-digit",minute:"2-digit"});
+          return `<div style="display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #eee;">
+            <span style="flex:1;font-family:monospace;font-size:13px;">${m.upc}</span>
+            <span style="font-size:11px;color:#999;white-space:nowrap;">${ts}</span>
+            <button data-lookup="${m.upc}" style="font-size:11px;padding:3px 8px;cursor:pointer;">Lookup</button>
+            <button data-remove="${i}" style="font-size:11px;padding:3px 8px;cursor:pointer;color:#c0392b;">✕</button>
+          </div>`;
+        }).join("");
+      };
+
+      modal.innerHTML = `
+        <div style="background:white;border-radius:8px;padding:20px;width:420px;max-height:80vh;overflow-y:auto;position:relative;box-shadow:0 4px 20px rgba(0,0,0,0.3);">
+          <button id="pm-missed-close" style="position:absolute;top:10px;right:12px;background:none;border:none;font-size:22px;cursor:pointer;color:#888;">&times;</button>
+          <h3 style="margin:0 0 4px;">⚠️ Missed Items</h3>
+          <p style="margin:0 0 12px;font-size:12px;color:#777;">Items scanned but not found in system. Click Lookup to open the new item flow.</p>
+          <div id="pm-missed-list">${renderRows()}</div>
+          <div style="margin-top:12px;text-align:right;">
+            <button id="pm-missed-clear" style="font-size:11px;padding:4px 10px;cursor:pointer;color:#c0392b;">Clear All</button>
+          </div>
+        </div>`;
+
+      document.body.appendChild(modal);
+
+      modal.querySelector("#pm-missed-close").addEventListener("click", () => modal.remove());
+      modal.addEventListener("click", e => { if (e.target === modal) modal.remove(); });
+
+      modal.querySelector("#pm-missed-clear").addEventListener("click", () => {
+        this.missedItems = [];
+        this.saveMissedItems();
+        this.updateMissedBadge();
+        modal.querySelector("#pm-missed-list").innerHTML = renderRows();
+      });
+
+      modal.addEventListener("click", e => {
+        if (e.target.dataset.lookup) {
+          modal.remove();
+          this.showProductResearchModal(e.target.dataset.lookup);
+        }
+        if (e.target.dataset.remove !== undefined) {
+          const idx = parseInt(e.target.dataset.remove, 10);
+          this.missedItems.splice(idx, 1);
+          this.saveMissedItems();
+          this.updateMissedBadge();
+          modal.querySelector("#pm-missed-list").innerHTML = renderRows();
+        }
+      });
     }
 
     showAbout() {
