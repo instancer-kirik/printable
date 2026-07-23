@@ -1,0 +1,2221 @@
+// ==UserScript==
+// @name         Printable Automation
+// @namespace    http://tampermonkey.net/
+// @version      1.1
+// @description  Automate product maintenance with label printing capabilities
+// @author       instance.select
+// @match        *://*marktpos*/*
+// @match        *://marktpos*/*
+// @match        https://app.marktpos.com/*
+// @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
+// @connect      localhost
+// @connect      world.openfoodfacts.org
+// @connect      api.upcitemdb.com
+// ==/UserScript==
+
+(function () {
+  "use strict";
+
+  // Utility functions
+  function log(message, ...args) {
+    console.log(`[Product Maintenance Automation] ${message}`, ...args);
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  class ProductMaintenanceAutomation {
+    constructor() {
+      this.controlPanel = null;
+      this.lastUpcValue = "";
+      this.scanTimeout = null;
+      this.lastProductData = null;
+      this.processingBarcode = false;
+      this.printQty = 1;  // batch label quantity — shared by manual print and auto-print
+
+      // Restore auto-print preference
+      try {
+        const saved = localStorage.getItem("pm-autoprint-enabled");
+        this.autoPrintEnabled = saved === "true";
+      } catch {
+        this.autoPrintEnabled = false;
+      }
+
+      this.printSettings = this.loadPrintSettings();
+    }
+
+    async init() {
+      log("🚀 Initializing...");
+      await this.waitForAppReady();
+      this.addStyles();
+      this.addControlPanel();
+      this.setupEventListeners();
+      this.setupBarcodeDetection();
+      this.checkPrintCapabilities();
+      log(`✅ Ready (Auto-print: ${this.autoPrintEnabled ? "ON" : "OFF"})`);
+    }
+
+    // ---------- Print settings (label size / DPI) ----------
+
+    defaultPrintSettings() {
+      return {
+        dpi: 203, // 203 or 300 - unknown until confirmed on the ZT231; use "Print Config Label" to check
+        widthIn: 1.5, // physical label width in inches (ZT231 stock: 1.5" x 1")
+        heightIn: 1.0, // physical label height in inches
+        nameFontDots: 22,
+        priceFontDots: 45,
+        storeName: "VDG",      // store name printed at top of label
+        // --- Physical printer adjustments ---
+        labelShift: 0,         // ^LS  horizontal offset in dots (+ = right, − = left). Tune this to align label — each dot = ~0.005" at 203dpi
+        labelTop: 0,           // ^LT  vertical offset in dots   (+ = down,  - = up)
+        darkness: 18,          // ~SD  print darkness 0-30
+        printSpeed: 4,         // ^PR  print speed in inches/sec (1-14 depending on model)
+        // --- Barcode ---
+        storeNameFontDots: 26,  // font size for store name (VDG) header
+        barcodeModuleWidth: 1,   // ^BY module width — integers only (ZPL rounds decimals); 1 fits better on 1.5" label
+        barcodeHeightDots: 40,  // barcode bar height in dots (not counting HRI text below)
+        // --- AI Pricing ---
+        pricingFactor: 0.85,    // fraction of market high price to suggest (e.g. 0.85 = 15% below retail)
+      };
+    }
+
+    loadPrintSettings() {
+      try {
+        const saved = localStorage.getItem("pm-print-settings-v3");
+        if (saved) {
+          return Object.assign(this.defaultPrintSettings(), JSON.parse(saved));
+        }
+      } catch (error) {
+        log("Could not load print settings, using defaults:", error);
+      }
+      return this.defaultPrintSettings();
+    }
+
+    savePrintSettingsToStorage() {
+      try {
+        localStorage.setItem(
+          "pm-print-settings-v3",
+          JSON.stringify(this.printSettings),
+        );
+        log("💾 Print settings saved:", this.printSettings);
+      } catch (error) {
+        log("❌ Could not save print settings:", error);
+      }
+    }
+
+    // Convert current settings into dot dimensions for ZPL
+    getLabelDots() {
+      const dpi = this.printSettings.dpi;
+      return {
+        dpi,
+        widthDots: Math.round(this.printSettings.widthIn * dpi),
+        heightDots: Math.round(this.printSettings.heightIn * dpi),
+      };
+    }
+
+    // Wait until the UPC field is in the DOM — that's the real signal the app is ready.
+    // The old waitForAngular() checked window.angular which is AngularJS 1.x and doesn't
+    // exist in this Angular 2+ app, causing a guaranteed 10-second timeout every load.
+    async waitForAppReady() {
+      for (let i = 0; i < 50; i++) {
+        if (this.findUpcField()) {
+          log("✅ App ready — UPC field found");
+          return;
+        }
+        await sleep(200);
+      }
+      log("⚠️ UPC field not found after 10s, proceeding anyway");
+    }
+
+    addStyles() {
+      const styles = `
+                #pm-control-panel {
+                    position: fixed;
+                    top: 10px;
+                    right: 10px;
+                    width: 280px;
+                    background: #f8f9fa;
+                    border: 2px solid #007bff;
+                    border-radius: 8px;
+                    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+                    z-index: 10000;
+                    font-family: Arial, sans-serif;
+                    font-size: 13px;
+                }
+
+                #pm-control-panel .header {
+                    background: #007bff;
+                    color: white;
+                    padding: 8px 12px;
+                    border-radius: 6px 6px 0 0;
+                    font-weight: bold;
+                    cursor: move;
+                    user-select: none;
+                }
+
+                #pm-control-panel .content {
+                    padding: 12px;
+                }
+
+                #pm-control-panel .status {
+                    background: #e9ecef;
+                    padding: 6px 8px;
+                    border-radius: 4px;
+                    margin-bottom: 8px;
+                    font-size: 11px;
+                }
+
+                #pm-control-panel .status-error {
+                    background: #f8d7da;
+                    color: #721c24;
+                    border: 1px solid #f5c6cb;
+                }
+
+                #pm-control-panel .status-success {
+                    background: #d4edda;
+                    color: #155724;
+                    border: 1px solid #c3e6cb;
+                }
+
+                #pm-control-panel .button-group {
+                    display: flex;
+                    gap: 4px;
+                    margin-bottom: 8px;
+                }
+
+                #pm-control-panel button {
+                    flex: 1;
+                    padding: 6px 8px;
+                    border: 1px solid #ddd;
+                    border-radius: 4px;
+                    background: white;
+                    cursor: pointer;
+                    font-size: 11px;
+                    transition: all 0.2s;
+                }
+
+                #pm-control-panel button:hover {
+                    background: #f8f9fa;
+                    border-color: #007bff;
+                }
+
+                #pm-control-panel button:active {
+                    background: #e9ecef;
+                }
+
+                #pm-control-panel button:disabled {
+                    opacity: 0.6;
+                    cursor: not-allowed;
+                }
+
+                #pm-control-panel .print-btn {
+                    background: #28a745 !important;
+                    color: white !important;
+                    border-color: #28a745 !important;
+                }
+
+                #pm-control-panel .print-btn:hover {
+                    background: #218838 !important;
+                    border-color: #218838 !important;
+                }
+
+                #pm-control-panel .danger-btn {
+                    background: #dc3545 !important;
+                    color: white !important;
+                    border-color: #dc3545 !important;
+                }
+
+                #pm-control-panel .danger-btn:hover {
+                    background: #c82333 !important;
+                    border-color: #c82333 !important;
+                }
+
+                #pm-control-panel .minimize-btn {
+                    position: absolute;
+                    top: 8px;
+                    right: 8px;
+                    background: none;
+                    border: none;
+                    color: white;
+                    cursor: pointer;
+                    font-size: 16px;
+                    line-height: 1;
+                    padding: 0;
+                    width: 20px;
+                    height: 20px;
+                }
+
+                #pm-control-panel.minimized .content {
+                    display: none;
+                }
+
+                #pm-control-panel.minimized {
+                    width: auto;
+                }
+
+                /* About Modal Styles */
+                #pm-about-modal {
+                    position: fixed;
+                    top: 0;
+                    left: 0;
+                    width: 100%;
+                    height: 100%;
+                    background: rgba(0, 0, 0, 0.5);
+                    z-index: 10001;
+                    display: none;
+                    align-items: center;
+                    justify-content: center;
+                }
+
+                #pm-about-modal.show {
+                    display: flex;
+                }
+
+                #pm-about-content {
+                    background: white;
+                    border-radius: 8px;
+                    padding: 20px;
+                    max-width: 600px;
+                    max-height: 80vh;
+                    overflow-y: auto;
+                    position: relative;
+                    box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+                }
+
+                #pm-about-content h2 {
+                    margin-top: 0;
+                    color: #2c3e50;
+                    border-bottom: 2px solid #3498db;
+                    padding-bottom: 10px;
+                }
+
+                #pm-about-content h3 {
+                    color: #34495e;
+                    margin-top: 20px;
+                }
+
+                #pm-about-content pre {
+                    background: #f8f9fa;
+                    border: 1px solid #dee2e6;
+                    border-radius: 4px;
+                    padding: 10px;
+                    overflow-x: auto;
+                    font-family: 'Courier New', monospace;
+                    font-size: 12px;
+                }
+
+                #pm-about-content code {
+                    background: #f8f9fa;
+                    padding: 2px 4px;
+                    border-radius: 3px;
+                    font-family: 'Courier New', monospace;
+                }
+
+                .about-close-btn {
+                    position: absolute;
+                    top: 10px;
+                    right: 15px;
+                    background: none;
+                    border: none;
+                    font-size: 24px;
+                    cursor: pointer;
+                    color: #666;
+                }
+
+                .about-close-btn:hover {
+                    color: #000;
+                }
+            `;
+
+      // CHANGED: use GM_addStyle so the page's CSP (style-src) can't block it
+        if (typeof GM_addStyle === "function") {
+            GM_addStyle(styles);
+        } else {
+            const styleSheet = document.createElement("style");
+            styleSheet.textContent = styles;
+            document.head.appendChild(styleSheet);
+        }
+    }
+
+    addControlPanel() {
+      const panel = document.createElement("div");
+      panel.id = "pm-control-panel";
+      panel.innerHTML = `
+                <div class="header">
+                    Product Maintenance Control
+                    <button class="minimize-btn" title="Minimize">−</button>
+                </div>
+                <div class="content">
+                    <div class="status" id="pm-status">Ready</div>
+                    <div class="button-group" style="align-items:center;">
+                        <button id="pm-print-current" class="print-btn" title="Print current product label (Ctrl+P)">Print Label</button>
+                        <button id="pm-focus-upc" title="Focus UPC field">Focus UPC</button>
+                    </div>
+                    <div class="button-group" style="align-items:center;gap:4px;">
+                        <span style="font-size:11px;white-space:nowrap;">Qty:</span>
+                        <button id="pm-qty-dec" title="Decrease label quantity" style="flex:0;padding:4px 8px;font-size:14px;line-height:1;">−</button>
+                        <input id="pm-qty" type="number" min="1" max="999" value="1"
+                          title="Number of labels to print per scan / per click"
+                          style="width:46px;text-align:center;padding:4px 2px;font-size:13px;border:1px solid #ddd;border-radius:4px;">
+                        <button id="pm-qty-inc" title="Increase label quantity" style="flex:0;padding:4px 8px;font-size:14px;line-height:1;">+</button>
+                        <span id="pm-qty-label" style="font-size:10px;color:#555;white-space:nowrap;">labels</span>
+                    </div>
+
+                    <div class="button-group">
+                        <button id="pm-market-research" title="Search for current product online (Ctrl+M)">Market Research</button>
+                        <button id="pm-upc-lookup" title="Price check current UPC online (Ctrl+L)">UPC Lookup</button>
+                    </div>
+                    <div class="button-group">
+                        <button id="pm-print-settings" title="Configure print settings and test labels">Print Settings & Test</button>
+                        <button id="pm-toggle-autoprint" title="Toggle auto-print on scan">Auto-Print: ${this.autoPrintEnabled ? "ON" : "OFF"}</button>
+                    </div>
+                    <div class="button-group">
+                        <button id="pm-print-config-label" title="Print the Zebra printer's built-in configuration/status label (shows real DPI)">Print Config Label</button>
+                        <button id="pm-select-printer" title="Choose which Browser Print printer to send labels to">Select Printer</button>
+                    </div>
+                    <div class="button-group">
+                        <button id="pm-about" title="About this tool and setup instructions">About</button>
+                        <button id="pm-toggle-panel" title="Minimize panel">Minimize</button>
+                    </div>
+                </div>
+            `;
+
+      document.body.appendChild(panel);
+      this.controlPanel = panel;
+      this.makeDraggable(panel);
+    }
+
+    makeDraggable(element) {
+      let pos1 = 0,
+        pos2 = 0,
+        pos3 = 0,
+        pos4 = 0;
+      const header = element.querySelector(".header");
+
+      header.onmousedown = dragMouseDown;
+
+      function dragMouseDown(e) {
+        e.preventDefault();
+        pos3 = e.clientX;
+        pos4 = e.clientY;
+        document.onmouseup = closeDragElement;
+        document.onmousemove = elementDrag;
+      }
+
+      function elementDrag(e) {
+        e.preventDefault();
+        pos1 = pos3 - e.clientX;
+        pos2 = pos4 - e.clientY;
+        pos3 = e.clientX;
+        pos4 = e.clientY;
+        element.style.top = element.offsetTop - pos2 + "px";
+        element.style.left = element.offsetLeft - pos1 + "px";
+      }
+
+      function closeDragElement() {
+        document.onmouseup = null;
+        document.onmousemove = null;
+      }
+    }
+
+    setupEventListeners() {
+      // Print current product
+      document
+        .getElementById("pm-print-current")
+        .addEventListener("click", () => {
+          this.printCurrentProduct();
+        });
+
+      // Qty stepper
+      const qtyInput = document.getElementById("pm-qty");
+      document.getElementById("pm-qty-dec").addEventListener("click", () => {
+        const v = Math.max(1, parseInt(qtyInput.value || "1", 10) - 1);
+        qtyInput.value = v;
+        this.printQty = v;
+        this._updateQtyLabel();
+      });
+      document.getElementById("pm-qty-inc").addEventListener("click", () => {
+        const v = Math.min(999, parseInt(qtyInput.value || "1", 10) + 1);
+        qtyInput.value = v;
+        this.printQty = v;
+        this._updateQtyLabel();
+      });
+      qtyInput.addEventListener("change", () => {
+        const v = Math.max(1, Math.min(999, parseInt(qtyInput.value || "1", 10) || 1));
+        qtyInput.value = v;
+        this.printQty = v;
+        this._updateQtyLabel();
+      });
+
+      // Focus UPC field
+      document.getElementById("pm-focus-upc").addEventListener("click", () => {
+        this.focusUPCField();
+      });
+
+      // Market research
+      document
+        .getElementById("pm-market-research")
+        .addEventListener("click", () => {
+          this.performMarketResearch();
+        });
+
+      // UPC Lookup
+      document.getElementById("pm-upc-lookup").addEventListener("click", () => {
+        this.performUPCLookup();
+      });
+
+      // Print Settings
+      document
+        .getElementById("pm-print-settings")
+        .addEventListener("click", () => {
+          this.showPrintSettings();
+        });
+
+      // Toggle auto-print — set initial background colour here now that the button exists
+      const autoPrintBtn = document.getElementById("pm-toggle-autoprint");
+      autoPrintBtn.style.background = this.autoPrintEnabled ? "#28a745" : "#6c757d";
+      autoPrintBtn.addEventListener("click", () => this.toggleAutoPrint());
+
+      // Print printer configuration/status label (shows real DPI, calibration, firmware, etc.)
+      document
+        .getElementById("pm-print-config-label")
+        .addEventListener("click", () => {
+          this.printConfigLabel();
+        });
+
+      document
+        .getElementById("pm-select-printer")
+        .addEventListener("click", () => {
+          this.showPrinterSelector();
+        });
+
+      // About
+      document.getElementById("pm-about").addEventListener("click", () => {
+        this.showAbout();
+      });
+
+      // Toggle panel
+      document
+        .getElementById("pm-toggle-panel")
+        .addEventListener("click", () => {
+          this.togglePanel();
+        });
+
+      // Minimize button
+      document
+        .querySelector("#pm-control-panel .minimize-btn")
+        .addEventListener("click", () => {
+          this.controlPanel.classList.toggle("minimized");
+        });
+
+      // Keyboard shortcuts
+      document.addEventListener("keydown", (e) => {
+        if (e.ctrlKey || e.metaKey) {
+          switch (e.key) {
+            case "p":
+              e.preventDefault();
+              this.printCurrentProduct();
+              break;
+            case "u":
+              e.preventDefault();
+              this.focusUPCField();
+              break;
+            case "l":
+              e.preventDefault();
+              this.performUPCLookup();
+              break;
+            case "m":
+              e.preventDefault();
+              this.performMarketResearch();
+              break;
+          }
+        }
+      });
+    }
+
+    updateStatus(message, type = "normal") {
+      const statusElement = document.getElementById("pm-status");
+      if (statusElement) {
+        statusElement.textContent = message;
+
+        // Reset classes
+        statusElement.className = "status";
+
+        // Add type-specific styling
+        if (type === "error") {
+          statusElement.classList.add("status-error");
+        } else if (type === "success") {
+          statusElement.classList.add("status-success");
+        }
+
+        log(`Status: ${message}`);
+      }
+    }
+
+    findUpcField() {
+      // Case 1: placeholder explicitly says "Enter UPC"
+      let field = document.querySelector('input[placeholder="Enter UPC" i]');
+      if (field) return field;
+
+      // Case 2: generic placeholder, but a <mat-label> nearby contains "upc"
+      const labels = document.querySelectorAll('mat-label');
+      for (const label of labels) {
+        if (label.textContent.trim().toLowerCase() === 'upc') {
+          const formField = label.closest('mat-form-field');
+          if (formField) {
+            const input = formField.querySelector('input');
+            if (input) return input;
+          }
+        }
+      }
+
+      return null;
+    }
+
+    getCurrentProductData() {
+      const data = {};
+
+      try {
+        // Get UPC
+        const upcField = this.findUpcField();
+        data.upc = upcField?.value || "";
+
+        // Get description/name
+        // The field is an <input class="app-text-input"> with placeholder "Enter product description"
+        // mat-input IDs like "mat-input-1" are dynamic, so match by placeholder or class+label
+        const nameField =
+          document.querySelector('input[placeholder="Enter product description"]') ||
+          document.querySelector('textarea[name="stringAreaCtrl"]') ||
+          document.querySelector("string-area-picker textarea") ||
+          this.findFieldByLabelText("Description") ||
+          this.findFieldByLabelText("Name");
+        data.name = nameField?.value || "";
+
+        // Get price
+        const priceField =
+          document.querySelector("#unit-price") ||
+          document.querySelector('money-picker input[id="unit-price"]') ||
+          this.findFieldByLabelText("Price");
+        data.price = priceField?.value || "";
+
+        // Get cost
+        const costField =
+          document.querySelector("#cost") ||
+          document.querySelector('money-picker input[id="cost"]') ||
+          this.findFieldByLabelText("Cost");
+        data.cost = costField?.value || "";
+
+        // Get department
+        const deptElement = document.querySelector("departments-picker");
+        data.department = deptElement?.textContent?.trim() || "";
+
+        log("Current product data:", data);
+        return data;
+      } catch (error) {
+        log("Error getting current product data:", error);
+        return data;
+      }
+    }
+
+    // Checks whether the page is showing the "Product not found with this UPC" alert
+    isProductNotFound() {
+      const spans = document.querySelectorAll('app-alerts .alert-item span');
+      for (const span of spans) {
+        if (span.textContent.includes('Product not found with this UPC')) return true;
+      }
+      return false;
+    }
+
+    // Normalise a UPC string for loose comparison:
+    // strip leading zeros and non-digits so "012345678901" ≡ "12345678901".
+    _normaliseUpc(upc) {
+      return (upc || "").replace(/\D/g, "").replace(/^0+/, "") || "";
+    }
+
+    async pollForProductData(expectedUpc, maxAttempts = 15) {
+      log(`Starting to poll for product data for UPC: ${expectedUpc}`);
+      const normExpected = this._normaliseUpc(expectedUpc);
+
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        // Bail early if the system already told us the product doesn't exist
+        if (this.isProductNotFound()) {
+          log(`🔍 "Product not found" alert detected on attempt ${attempt} — stopping poll`);
+          return null;
+        }
+
+        const currentData = this.getCurrentProductData();
+        const formUpc     = (currentData.upc || "").trim();
+        const normForm    = this._normaliseUpc(formUpc);
+
+        log(
+          `Poll attempt ${attempt}/${maxAttempts}: UPC="${formUpc}", Name="${currentData.name}", Price="${currentData.price}"`,
+        );
+
+        // UPC match check — lenient: ignore leading-zero differences,
+        // and treat empty form UPC as "still loading" (not a mismatch).
+        const upcOk = !normForm || normForm === normExpected;
+
+        if (!upcOk) {
+          log(`⏳ Stale UPC in form (${formUpc} ≠ ${expectedUpc}), waiting for form to update…`);
+          this.updateStatus(`Loading... (${attempt}/${maxAttempts})`);
+          await sleep(250);
+          continue;
+        }
+
+        // Primary signal: name field populated means the app has loaded the product.
+        // Price may arrive at the same time or slightly after; we return as soon
+        // as we see a name so the user isn’t kept waiting unnecessarily.
+        // printCurrentProduct will block + warn if price is still missing.
+        if (currentData.name) {
+          log(`✅ Product name detected on attempt ${attempt} — returning data (price="${currentData.price}")`);
+          return currentData;
+        }
+
+        this.updateStatus(`Loading... (${attempt}/${maxAttempts})`);
+        await sleep(250);
+      }
+
+      log(`❌ No product data found after ${maxAttempts} attempts`);
+      return null;
+    }
+
+    // Strip currency symbols/spaces and check the number is > 0.
+    isValidPrice(price) {
+      const n = parseFloat((price || "").toString().replace(/[^0-9.]/g, ""));
+      return !isNaN(n) && n > 0;
+    }
+
+    // fetch() is subject to the page's CSP connect-src, which blocks localhost
+    // on marktpos. GM_xmlhttpRequest runs outside the page context and isn't
+    // subject to that CSP, so we use it for all localhost printer/server calls.
+    gmRequest(details) {
+      return new Promise((resolve, reject) => {
+        if (typeof GM_xmlhttpRequest !== "function") {
+          reject(new Error("GM_xmlhttpRequest not available - re-check @grant in script header"));
+          return;
+        }
+        GM_xmlhttpRequest({
+          ...details,
+          onload: (response) => resolve(response),
+          onerror: (response) => reject(new Error(
+            `Network error reaching ${details.url} (status ${response.status || 0}) — ` +
+            (response.statusText || "connection refused or cert rejected")
+          )),
+          ontimeout: () => reject(new Error("Request timed out")),
+        });
+      });
+    }
+
+    // Always use the plain-HTTP port regardless of page protocol.
+    // GM_xmlhttpRequest runs in a privileged context and is not subject to
+    // mixed-content restrictions, so this works fine on HTTPS pages.
+    // Port 9101 (HTTPS) is avoided because Tampermonkey does not bypass
+    // the agent's self-signed cert, causing status-0 errors.
+    // Chrome's Private Network Access (PNA) policy also blocks window.BrowserPrint
+    // SDK calls to localhost from HTTPS pages, so we skip the SDK entirely.
+    get bpBaseUrl() {
+      return "http://localhost:9100";
+    }
+
+
+    findFieldByLabelText(labelText) {
+      const labels = document.querySelectorAll("mat-label");
+      const target = labelText.trim().toLowerCase();
+      for (const label of labels) {
+        if (label.textContent.trim().toLowerCase().startsWith(target)) {
+          const formField = label.closest("mat-form-field");
+          if (formField) {
+            const field = formField.querySelector("input, textarea");
+            if (field) return field;
+          }
+        }
+      }
+      return null;
+    }
+
+    async printCurrentProduct(productData = null, qty = null) {
+      const count = (qty != null) ? qty : this.printQty;
+      this.updateStatus(count > 1 ? `Printing ${count} labels...` : "Printing...");
+
+      // Use provided data or get from UI as fallback
+      const dataToUse = productData || this.getCurrentProductData();
+
+      if (!this.isValidPrice(dataToUse.price)) {
+        this.updateStatus("⚠️ Cannot print: No price set for this product");
+        log("Print blocked: Product has no valid price");
+        return;
+      }
+
+      try {
+        // Use Zebra APIs directly
+        log(`🦓 Printing via Zebra APIs (qty=${count})`);
+        await this.printViaZebra(dataToUse, count);
+        this.updateStatus(count > 1 ? `✅ ${count} labels printed!` : "✅ Label printed successfully!");
+      } catch (zebraError) {
+        log("Zebra printing failed:", zebraError);
+        this.updateStatus("❌ Print failed - check Zebra connection");
+      }
+    }
+
+    async printViaZebra(productData, qty = 1) {
+      const zplCommands = this.createZPLCommands(productData, qty);
+      return await this.sendZPL(zplCommands);
+    }
+
+    // Send raw ZPL via the Browser Print local agent REST API.
+    async sendZPL(zplCommands) {
+      const device = await this.getSelectedPrinterDevice();
+      log("✅ Sending ZPL to printer:", device.name || device.uid);
+      const response = await this.gmRequest({
+        method: "POST",
+        url: `${this.bpBaseUrl}/write`,
+        data: JSON.stringify({ device, data: zplCommands }),
+        headers: { "Content-Type": "application/json" },
+        timeout: 10000,
+      });
+      if (response.status >= 200 && response.status < 300) {
+        log("✅ ZPL accepted by Browser Print agent");
+      } else {
+        throw new Error(`Browser Print agent returned ${response.status}: ${response.responseText}`);
+      }
+    }
+
+    // List printers via the Browser Print local agent REST API (port 9100, plain HTTP).
+    // GM_xmlhttpRequest bypasses mixed-content and PNA restrictions, so this works
+    // from any page including HTTPS. We skip window.BrowserPrint because Chrome's
+    // Private Network Access policy blocks its XHR calls to localhost on HTTPS pages.
+    async listBrowserPrintPrinters() {
+      const response = await this.gmRequest({
+        method: "GET",
+        url: `${this.bpBaseUrl}/available?type=printer`,
+        timeout: 5000,
+      });
+      if (response.status < 200 || response.status >= 300) {
+        throw new Error(`Browser Print agent unavailable (HTTP ${response.status})`);
+      }
+      const body = JSON.parse(response.responseText || "{}");
+      return Array.isArray(body) ? body : body.printer || body.Printer || [];
+    }
+
+    // Resolve which printer device to send to: saved preference > ZT231 by name > sole device
+    async getSelectedPrinterDevice() {
+      const printers = await this.listBrowserPrintPrinters();
+      if (!printers || printers.length === 0) {
+        throw new Error("No printers found by Browser Print");
+      }
+
+      const savedUid = localStorage.getItem("pm-selected-printer-uid");
+      if (savedUid) {
+        const match = printers.find((p) => p.uid === savedUid);
+        if (match) return match;
+        log(`⚠️ Saved printer uid "${savedUid}" not found among current devices`);
+      }
+
+      const zt231 = printers.find((p) =>
+        (p.name || "").toUpperCase().includes("ZT231"),
+      );
+      if (zt231) {
+        log("🎯 Auto-matched ZT231 printer:", zt231);
+        return zt231;
+      }
+
+      if (printers.length === 1) {
+        return printers[0];
+      }
+
+      throw new Error(
+        `Multiple printers found (${printers.map((p) => p.name).join(", ")}) - use "Select Printer" to choose one`,
+      );
+    }
+
+    async showPrinterSelector() {
+      this.updateStatus("Looking for printers...");
+      let printers;
+      try {
+        printers = await this.listBrowserPrintPrinters();
+      } catch (error) {
+        this.updateStatus("❌ Could not list printers - " + error.message, "error");
+        return;
+      }
+
+      if (!printers || printers.length === 0) {
+        this.updateStatus("❌ No printers found", "error");
+        return;
+      }
+
+      const existingModal = document.getElementById("pm-printer-select-modal");
+      if (existingModal) existingModal.remove();
+
+      const modal = document.createElement("div");
+      modal.id = "pm-printer-select-modal";
+      modal.style.cssText = `
+        position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+        background: rgba(0,0,0,0.5); z-index: 10002; display: flex;
+        align-items: center; justify-content: center;
+      `;
+
+      const listHtml = printers
+        .map(
+          (p, i) =>
+            `<button class="pm-printer-option" data-uid="${p.uid}" style="display:block;width:100%;margin:6px 0;padding:10px;text-align:left;cursor:pointer;">${p.name || "Unnamed printer " + i}</button>`,
+        )
+        .join("");
+
+      modal.innerHTML = `
+        <div style="background:white;padding:20px;border-radius:8px;max-width:360px;width:90%;">
+          <h3 style="margin-top:0;">Select Printer</h3>
+          ${listHtml}
+          <button id="pm-printer-select-cancel" style="margin-top:10px;width:100%;padding:8px;">Cancel</button>
+        </div>
+      `;
+
+      document.body.appendChild(modal);
+
+      modal.querySelectorAll(".pm-printer-option").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const uid = btn.dataset.uid;
+          localStorage.setItem("pm-selected-printer-uid", uid);
+          this.updateStatus(`✅ Printer saved: ${btn.textContent}`, "success");
+          log(`💾 Selected printer uid: ${uid}`);
+          modal.remove();
+        });
+      });
+
+      modal.querySelector("#pm-printer-select-cancel").addEventListener("click", () => {
+        modal.remove();
+      });
+
+      modal.addEventListener("click", (e) => {
+        if (e.target === modal) modal.remove();
+      });
+    }
+
+
+
+    // Print the printer's own configuration/status label so you can read the
+    // real DPI, firmware version, calibration state, etc. off of a physical label.
+    async printConfigLabel() {
+      this.updateStatus("Sending config label request...");
+      try {
+        await this.sendZPL("~WC");
+        this.updateStatus("✅ Config label sent - check printer", "success");
+      } catch (error) {
+        this.updateStatus("❌ Could not send config label", "error");
+        log("Config label error:", error);
+      }
+    }
+
+    // Returns the store logo as a ZPL ^GFA graphic command, or "" if none configured.
+    // To add your logo: convert it to ZPL using Zebra's ZebraDesigner / online
+    // "image to ZPL" tools set to your printer's DPI, then paste the resulting
+    // ^GFA,... line as the value of window.PM_STORE_LOGO_ZPL before this script
+    // runs, or hardcode it here. Placement (x,y) is controlled by logoX/logoY below.
+    getLogoZPL() {
+      const logoData = window.PM_STORE_LOGO_ZPL || this.printSettings.logoZPL || "";
+      if (!logoData) return "";
+      const logoX = this.printSettings.logoX ?? 20;
+      const logoY = this.printSettings.logoY ?? 5;
+      return `^FO${logoX},${logoY}${logoData}^FS\n`;
+    }
+
+    // Wraps a product name into at most 2 lines, each at most maxChars characters.
+    // Breaks on word boundaries; hard-truncates only if a single word exceeds maxChars.
+    wrapNameLines(name, maxChars) {
+      if (!name) return { line1: "", line2: "" };
+      if (name.length <= maxChars) return { line1: name, line2: "" };
+
+      const words = name.split(/\s+/);
+      let line1 = "";
+      let splitAt = 0;
+
+      for (let i = 0; i < words.length; i++) {
+        const candidate = line1 ? `${line1} ${words[i]}` : words[i];
+        if (candidate.length <= maxChars) {
+          line1 = candidate;
+          splitAt = i + 1;
+        } else {
+          break;
+        }
+      }
+
+      // Edge case: first word alone exceeds maxChars — hard-break it
+      if (!line1) {
+        line1 = words[0].substring(0, maxChars);
+        splitAt = 1;
+      }
+
+      // Build line2 from remaining words, fitting whole words only
+      const restWords = words.slice(splitAt);
+      let line2 = "";
+      for (const w of restWords) {
+        const candidate = line2 ? `${line2} ${w}` : w;
+        if (candidate.length <= maxChars) line2 = candidate;
+        else break;
+      }
+      // If still nothing fits (single long word), hard-truncate
+      if (!line2 && restWords.length) line2 = restWords[0].substring(0, maxChars);
+
+      return { line1, line2 };
+    }
+
+    createZPLCommands(productData, qty = 1) {
+      const name = (productData.name || "NO NAME").trim();
+      const price = productData.price || "0.00";
+      const upc = productData.upc || "";
+      const cleanPrice = price.toString().replace(/[^0-9.]/g, "");
+      const formattedPrice = parseFloat(cleanPrice || "0").toFixed(2);
+
+      const { widthDots, heightDots } = this.getLabelDots();
+      const nameFont = this.printSettings.nameFontDots;
+      const priceFont = this.printSettings.priceFontDots;
+      const storeName = (this.printSettings.storeName || "").trim();
+      const storeFont = this.printSettings.storeNameFontDots ?? 26;
+
+      // ZPL commands sized from configured label dimensions + DPI (see printSettings)
+      // ~SD must precede ^XA so the printer applies it before rendering the format
+      let zpl = `~SD${String(this.printSettings.darkness ?? 15).padStart(2, "0")}\n`; // Darkness (immediate)
+      zpl += "^XA\n"; // Start format
+      zpl += `^PR${this.printSettings.printSpeed ?? 4}\n`;  // Print speed
+      // Always send ^LS and ^LT so our setting is authoritative every job.
+      // labelShift compensates for physical media-to-printhead offset (+ shifts print right).
+      zpl += `^LS${this.printSettings.labelShift ?? 0}\n`;
+      if (this.printSettings.labelTop) zpl += `^LT${this.printSettings.labelTop}\n`;
+      zpl += "^PW" + widthDots + "\n"; // Print width in dots
+      zpl += "^LH0,0\n"; // Set label home position
+      zpl += "^LL" + heightDots + "\n"; // Set label length in dots
+
+      // Optional store logo
+      zpl += this.getLogoZPL();
+
+      const fieldW = widthDots - 20; // 10-dot inset each side
+
+      // Barcode sizing: auto-calculate module width to fill ~85% of fieldW.
+      // Code 128C for a 12-digit UPC = ~121 modules (bars + quiet zones).
+      // ZPL ^BY only accepts integers, so we floor to the nearest whole dot.
+      const HRI_FONT         = 14;   // small fixed font for HRI — separate from storeFont
+      const barcodeHeight    = this.printSettings.barcodeHeightDots  ?? 40;
+      const barcodeModuleWidth = Math.round(this.printSettings.barcodeModuleWidth ?? 2); // ^BY only accepts integers
+      // UPC-A (12 digits): 95 symbol + 18 quiet zone = 113 modules
+      // Code 128C fallback: 101 symbol + 20 quiet zone = 121 modules
+      // A 13-digit UPC starting with 0 is an EAN-13 encoding of a UPC-A — strip the leading 0.
+      const upcNorm = /^0\d{12}$/.test(upc) ? upc.substring(1) : upc;
+      const isUpcA = /^\d{12}$/.test(upcNorm);
+      const TOTAL_MODULES   = isUpcA ? 113 : 121;
+      const estBarcodeWidth = barcodeModuleWidth * TOTAL_MODULES;
+
+      // --- Y layout: name block at top, price+barcode anchored from bottom ---
+      const topMargin  = 15;
+      const storeNameY = topMargin;
+      const nameY1     = storeNameY + storeFont + 4;
+      const nameLineH  = Math.round(nameFont * 1.2);
+      const nameY2     = nameY1 + nameLineH;
+      // Barcode sits at bottom; HRI_FONT (not storeFont) is the HRI text height
+      const barcodeY      = heightDots - barcodeHeight - HRI_FONT - 3;
+      const priceYBottom  = barcodeY - priceFont - 6;          // ideal: just above barcode
+      const priceYTop     = nameY2 + nameFont + 8;             // minimum: 8 dots below name block
+      const priceY        = Math.max(priceYBottom, priceYTop); // whichever needs more room
+
+      const maxCharsPerLine = Math.max(8, Math.floor(fieldW / (nameFont * 0.65)));
+      const { line1, line2 } = this.wrapNameLines(name, maxCharsPerLine);
+
+      // Store name — centered
+      if (storeName) {
+        zpl += `^CF0,${storeFont}\n`;
+        zpl += `^FO10,${storeNameY}^FB${fieldW},1,0,C,0^FD${storeName}^FS\n`;
+      }
+
+      // Product name — centered, 1 or 2 lines
+      zpl += `^CF0,${nameFont}\n`;
+      zpl += `^FO10,${nameY1}^FB${fieldW},1,0,C,0^FD${line1}^FS\n`;
+      if (line2) {
+        zpl += `^FO10,${nameY2}^FB${fieldW},1,0,C,0^FD${line2}^FS\n`;
+      }
+
+      // Price — centered
+      zpl += `^CF0,${priceFont}\n`;
+      zpl += `^FO10,${priceY}^FB${fieldW},1,0,C,0^FD$${formattedPrice}^FS\n`;
+
+      if (upc && upc.length >= 8) {
+        const barcodeX = Math.max(0, Math.round((widthDots - estBarcodeWidth) / 2));
+        zpl += `^CF0,${HRI_FONT}\n`;
+        if (isUpcA) {
+          // ^BU expects 11 digits — printer calculates and appends the 12th (check digit)
+          // Sending all 12 digits with e=N produces a garbled barcode; this is the correct form
+          zpl += `^FO${barcodeX},${barcodeY}^BY${barcodeModuleWidth}^BUN,${barcodeHeight},Y,N,Y^FD${upcNorm.substring(0, 11)}^FS\n`;
+        } else {
+          // Code 128 for non-UPC-A (EAN-13, UPC-E, etc.)
+          zpl += `^FO${barcodeX},${barcodeY}^BY${barcodeModuleWidth}^BCN,${barcodeHeight},Y,N,N^FD${upcNorm}^FS\n`;
+        }
+      }
+
+      // Print quantity — ^PQ tells the printer to produce N copies from one job
+      if (qty > 1) zpl += `^PQ${qty}\n`;
+
+      zpl += "^XZ\n"; // End format
+
+      log(`🏷️ Generated ZPL (${widthDots}x${heightDots} dots @ ${this.printSettings.dpi}dpi, qty=${qty}):`, zpl);
+      return zpl;
+    }
+
+    createCustomZPL(productData, settings) {
+      const name = (productData.name || "NO NAME").trim();
+      const price = productData.price || "0.00";
+      const upc = productData.upc || "";
+      const cleanPrice = price.toString().replace(/[^0-9.]/g, "");
+      const formattedPrice = parseFloat(cleanPrice || "0").toFixed(2);
+
+      const dpi = parseInt(settings.dpi, 10) || this.printSettings.dpi;
+      const widthDots = Math.round(parseFloat(settings.width) * dpi);
+      const heightDots = Math.round(parseFloat(settings.height) * dpi);
+
+      // Custom ZPL with user settings - always 2 name lines
+      // ~SD must precede ^XA
+      let zpl = `~SD${String(parseInt(settings.darkness ?? this.printSettings.darkness ?? 15, 10)).padStart(2, "0")}\n`;
+      zpl += "^XA\n";
+      zpl += `^PR${settings.printSpeed ?? this.printSettings.printSpeed ?? 4}\n`;
+      const ls = settings.labelShift ?? this.printSettings.labelShift ?? 0;
+      const lt = settings.labelTop   ?? this.printSettings.labelTop   ?? 0;
+      zpl += `^LS${ls}\n`;
+      if (lt) zpl += `^LT${lt}\n`;
+      zpl += "^PW" + widthDots + "\n";
+      zpl += "^LH0,0\n";
+      zpl += "^LL" + heightDots + "\n";
+
+      zpl += this.getLogoZPL();
+
+      const storeName  = (this.printSettings.storeName || "").trim();
+      const storeFont  = parseInt(settings.storeNameFontDots ?? this.printSettings.storeNameFontDots ?? 26, 10);
+      const fieldWc    = widthDots - 20;
+      const priceSize  = parseInt(settings.priceSize, 10);
+      const nameSize   = parseInt(settings.nameSize, 10);
+
+      const HRI_FONT         = 14;
+      const barcodeHeight    = parseInt(settings.barcodeHeightDots ?? this.printSettings.barcodeHeightDots ?? 40, 10);
+      const barcodeModuleWidth = Math.round(parseFloat(settings.barcodeModuleWidth ?? this.printSettings.barcodeModuleWidth ?? 2));
+      // A 13-digit UPC starting with 0 is an EAN-13 encoding of a UPC-A — strip the leading 0.
+      const upcNorm = /^0\d{12}$/.test(upc) ? upc.substring(1) : upc;
+      const isUpcA = /^\d{12}$/.test(upcNorm);
+      const TOTAL_MODULES   = isUpcA ? 113 : 121;
+      const estBarcodeWidth = barcodeModuleWidth * TOTAL_MODULES;
+
+      const topMargin  = 15;
+      const storeNameY = topMargin;
+      const nameY1c    = storeNameY + storeFont + 4;
+      const nameLineHc = Math.round(nameSize * 1.2);
+      const nameY2c    = nameY1c + nameLineHc;
+      const barcodeY      = heightDots - barcodeHeight - HRI_FONT - 3;
+      const priceYBottom  = barcodeY - priceSize - 6;
+      const priceYTop     = nameY2c + nameSize + 8;
+      const priceYc       = Math.max(priceYBottom, priceYTop);
+
+      const maxCharsC = Math.max(8, Math.floor(fieldWc / (nameSize * 0.65)));
+      const { line1, line2 } = this.wrapNameLines(name, maxCharsC);
+
+      if (storeName) {
+        zpl += `^CF0,${storeFont}\n`;
+        zpl += `^FO10,${storeNameY}^FB${fieldWc},1,0,C,0^FD${storeName}^FS\n`;
+      }
+
+      zpl += `^CF0,${nameSize}\n`;
+      zpl += `^FO10,${nameY1c}^FB${fieldWc},1,0,C,0^FD${line1}^FS\n`;
+      if (line2) {
+        zpl += `^FO10,${nameY2c}^FB${fieldWc},1,0,C,0^FD${line2}^FS\n`;
+      }
+      zpl += `^CF0,${priceSize}\n`;
+      zpl += `^FO10,${priceYc}^FB${fieldWc},1,0,C,0^FD$${formattedPrice}^FS\n`;
+
+      if (upc && upc.length >= 8) {
+        const barcodeX = Math.max(0, Math.round((widthDots - estBarcodeWidth) / 2));
+        zpl += `^CF0,${HRI_FONT}\n`;
+        if (isUpcA) {
+          zpl += `^FO${barcodeX},${barcodeY}^BY${barcodeModuleWidth}^BUN,${barcodeHeight},Y,N,Y^FD${upcNorm.substring(0, 11)}^FS\n`;
+        } else {
+          zpl += `^FO${barcodeX},${barcodeY}^BY${barcodeModuleWidth}^BCN,${barcodeHeight},Y,N,N^FD${upcNorm}^FS\n`;
+        }
+      }
+
+      zpl += "^XZ\n";
+
+      log("🎨 Generated custom ZPL:", zpl);
+      return zpl;
+    }
+
+    async focusUPCField() {
+      const upcField = this.findUpcField();
+
+      if (upcField) {
+        upcField.focus();
+        upcField.select();
+        this.updateStatus("UPC field focused", "success");
+      } else {
+        this.updateStatus("UPC field not found", "error");
+      }
+    }
+
+    performMarketResearch() {
+      const upc = this.getCurrentProductData().upc?.trim();
+      if (upc) {
+        this.showProductResearchModal(upc);
+      } else {
+        this.updateStatus("No UPC loaded — scan a product first", "error");
+      }
+    }
+
+    performUPCLookup() {
+      const upc = this.getCurrentProductData().upc?.trim();
+      if (upc) {
+        this.showProductResearchModal(upc);
+      } else {
+        this.updateStatus("No UPC loaded — scan a product first", "error");
+      }
+    }
+
+    showPrintSettings() {
+      // Remove existing modal if present
+      const existingModal = document.getElementById("pm-print-settings-modal");
+      if (existingModal) {
+        existingModal.remove();
+      }
+
+      const s = this.printSettings;
+
+      const modal = document.createElement("div");
+      modal.id = "pm-print-settings-modal";
+      modal.innerHTML = `
+        <div id="pm-print-settings-content">
+          <button class="settings-close-btn">&times;</button>
+          <h3>Print Settings</h3>
+          <div class="settings-section">
+            <h4>Printer</h4>
+            <label>DPI:
+              <select id="label-dpi">
+                <option value="203" ${s.dpi === 203 ? "selected" : ""}>203 dpi</option>
+                <option value="300" ${s.dpi === 300 ? "selected" : ""}>300 dpi</option>
+              </select>
+              (unsure? use "Print Config Label" on the main panel)
+            </label>
+          </div>
+          <div class="settings-section">
+            <h4>Label Dimensions</h4>
+            <label>Width: <input type="text" id="label-width" value="${s.widthIn}" /> inches
+              <span style="color:#888;font-size:12px;margin-left:6px">(= ${Math.round(s.widthIn * s.dpi)} dots at current DPI)</span>
+            </label>
+            <label>Height: <input type="text" id="label-height" value="${s.heightIn}" /> inches
+              <span style="color:#888;font-size:12px;margin-left:6px">(= ${Math.round(s.heightIn * s.dpi)} dots at current DPI)</span>
+            </label>
+          </div>
+          <div class="settings-section">
+            <h4>Font Sizes (in printer dots)</h4>
+            <label>Store Name: <input type="number" id="store-name-font-size" value="${s.storeNameFontDots ?? 26}" min="10" max="60" /> dots</label>
+            <label>Product Name: <input type="number" id="name-font-size" value="${s.nameFontDots}" min="10" max="40" /> dots</label>
+            <label>Price: <input type="number" id="price-font-size" value="${s.priceFontDots}" min="20" max="80" /> dots</label>
+          </div>
+          <div class="settings-section">
+            <h4>Printer Physical Adjustments</h4>
+            <label>Horizontal Offset (<code>^LS</code>):
+              <input type="number" id="label-shift" value="${s.labelShift ?? 0}" min="-9999" max="9999" /> dots
+              <span style="color:#888;font-size:12px;margin-left:6px">+ shifts right, − shifts left. Tune until label edges are flush.</span>
+            </label>
+            <label>Vertical Offset (<code>^LT</code>):
+              <input type="number" id="label-top" value="${s.labelTop ?? 0}" min="-9999" max="9999" /> dots
+              <span style="color:#888;font-size:12px;margin-left:6px">+ shifts down, − shifts up</span>
+            </label>
+            <label>Darkness (<code>~SD</code>):
+              <input type="number" id="label-darkness" value="${s.darkness ?? 15}" min="0" max="30" /> (0–30)
+            </label>
+            <label>Print Speed (<code>^PR</code>):
+              <input type="number" id="label-speed" value="${s.printSpeed ?? 4}" min="1" max="14" /> in/sec
+            </label>
+            <label>Store Name:
+              <input type="text" id="label-store-name" value="${s.storeName ?? ''}" style="width:80px" />
+            </label>
+          </div>
+          <div class="settings-section">
+            <h4>AI Pricing</h4>
+            <label>Discount factor:
+              <input type="number" id="pricing-factor" value="${(s.pricingFactor ?? 0.85).toFixed(2)}" min="0.1" max="3" step="0.05" />
+              <span style="color:#888;font-size:12px;margin-left:6px">× market high price → suggested store price (0.85 = 15% below retail)</span>
+            </label>
+          </div>
+          <div class="settings-section">
+            <h4>Barcode</h4>
+            <label>Module Width (<code>^BY</code>):
+              <input type="number" id="barcode-module-width" value="${s.barcodeModuleWidth ?? 2}" min="1" max="10" step="1" /> dots
+              <span style="color:#888;font-size:12px;margin-left:6px">ZPL only accepts integers — if 2 overdraws, fix Horizontal Offset first</span>
+            </label>
+            <label>Bar Height:
+              <input type="number" id="barcode-height-dots" value="${s.barcodeHeightDots ?? 40}" min="10" max="200" /> dots
+            </label>
+          </div>
+          <div class="settings-buttons">
+            <button id="test-current-settings">Test Current Settings</button>
+            <button id="pm-show-zpl">Show ZPL</button>
+            <button id="pm-test-label">Test Label Format</button>
+            <button id="pm-test-server">Test Printer Connection</button>
+            <button id="reset-settings">Reset to Default</button>
+            <button id="save-settings">Save Settings</button>
+          </div>
+        </div>
+      `;
+
+      // Add modal styles
+      modal.style.cssText = `
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: 100%;
+        height: 100%;
+        background: rgba(0,0,0,0.5);
+        z-index: 10001;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        opacity: 0;
+        transition: opacity 0.3s ease;
+      `;
+
+      const content = modal.querySelector("#pm-print-settings-content");
+      content.style.cssText = `
+        background: white;
+        padding: 20px;
+        border-radius: 8px;
+        max-width: 400px;
+        width: 90%;
+        max-height: 80vh;
+        overflow-y: auto;
+        position: relative;
+      `;
+
+      document.body.appendChild(modal);
+
+      // Style form elements
+      modal.querySelectorAll("label").forEach((label) => {
+        label.style.cssText = "display: block; margin: 8px 0; font-size: 14px;";
+      });
+
+      modal
+        .querySelectorAll("input[type='text'], input[type='number']")
+        .forEach((input) => {
+          input.style.cssText = "margin-left: 10px; padding: 4px; width: 60px;";
+        });
+
+      modal.querySelectorAll("select").forEach((sel) => {
+        sel.style.cssText = "margin-left: 10px; padding: 4px;";
+      });
+
+      modal.querySelectorAll(".settings-section").forEach((section) => {
+        section.style.cssText =
+          "margin: 15px 0; padding: 10px; border: 1px solid #ddd; border-radius: 4px;";
+      });
+
+      modal.querySelectorAll("h4").forEach((h4) => {
+        h4.style.cssText = "margin: 0 0 10px 0; color: #333;";
+      });
+
+      modal.querySelector(".settings-buttons").style.cssText =
+        "text-align: center; margin-top: 20px;";
+
+      modal.querySelectorAll("button").forEach((btn) => {
+        btn.style.cssText =
+          "margin: 0 5px; padding: 8px 12px; cursor: pointer;";
+      });
+
+      // Show modal
+      setTimeout(() => {
+        modal.style.opacity = "1";
+      }, 10);
+
+      // Event listeners
+      modal
+        .querySelector(".settings-close-btn")
+        .addEventListener("click", () => {
+          modal.style.opacity = "0";
+          setTimeout(() => modal.remove(), 300);
+        });
+
+      modal
+        .querySelector("#test-current-settings")
+        .addEventListener("click", () => {
+          this.testLabelWithSettings(modal);
+        });
+
+      modal.querySelector("#reset-settings").addEventListener("click", () => {
+        this.resetPrintSettings(modal);
+      });
+
+      modal.querySelector("#save-settings").addEventListener("click", () => {
+        this.savePrintSettings(modal);
+      });
+
+      modal.querySelector("#pm-show-zpl").addEventListener("click", () => {
+        this.showZPLPreview(modal);
+      });
+
+      modal.querySelector("#pm-test-label").addEventListener("click", () => {
+        this.testLabelFormat();
+      });
+
+      modal.querySelector("#pm-test-server").addEventListener("click", () => {
+        this.testPrintServer();
+      });
+
+      // Click outside to close
+      modal.addEventListener("click", (e) => {
+        if (e.target === modal) {
+          modal.style.opacity = "0";
+          setTimeout(() => modal.remove(), 300);
+        }
+      });
+    }
+
+    showZPLPreview(modal) {
+      // Collect current modal values so preview reflects unsaved changes
+      const settings = {
+        dpi:        modal.querySelector("#label-dpi").value,
+        width:      modal.querySelector("#label-width").value,
+        height:     modal.querySelector("#label-height").value,
+        storeNameFontDots: modal.querySelector("#store-name-font-size").value,
+        nameSize:   modal.querySelector("#name-font-size").value,
+        priceSize:  modal.querySelector("#price-font-size").value,
+        labelShift:        modal.querySelector("#label-shift").value,
+        labelTop:          modal.querySelector("#label-top").value,
+        darkness:          modal.querySelector("#label-darkness").value,
+        printSpeed:          modal.querySelector("#label-speed").value,
+        storeName:           modal.querySelector("#label-store-name").value.trim(),
+        barcodeModuleWidth:  modal.querySelector("#barcode-module-width").value,
+        barcodeHeightDots:   modal.querySelector("#barcode-height-dots").value,
+      };
+
+      const productData = this.getCurrentProductData();
+      const sample = (!productData.name && !productData.upc)
+        ? { name: "TEST PRODUCT NAME", price: "12.99", upc: "123456789012" }
+        : productData;
+
+      const zpl = this.createCustomZPL(sample, settings);
+      const dpi = parseInt(settings.dpi, 10) || 203;
+      const wIn = parseFloat(settings.width) || 1.5;
+      const hIn = parseFloat(settings.height) || 1.0;
+
+      // Build a Labelary viewer URL for instant visual preview
+      const encoded = encodeURIComponent(zpl);
+      const labelaryUrl = `http://api.labelary.com/v1/printers/${dpi}dpmm/labels/${wIn}x${hIn}/0/`;
+
+      const win = window.open("", "_blank", "width=700,height=600");
+      if (win) {
+        win.document.write(`
+          <html><head><title>ZPL Preview</title></head>
+          <body style="font-family:monospace;padding:16px;background:#f5f5f5">
+            <h3>ZPL Preview &mdash; ${wIn}" &times; ${hIn}" @ ${dpi}dpi</h3>
+            <p style="font-size:13px">Paste the ZPL below into
+              <a href="http://labelary.com/viewer.html" target="_blank">labelary.com/viewer.html</a>
+              to see a visual render.</p>
+            <textarea id="zpl-out" style="width:100%;height:320px;font-size:12px;">${zpl}</textarea><br>
+            <button onclick="navigator.clipboard.writeText(document.getElementById('zpl-out').value).then(()=>alert('Copied!'))"
+              style="margin-top:8px;padding:6px 14px;cursor:pointer">Copy ZPL</button>
+            <a href="http://labelary.com/viewer.html" target="_blank"
+              style="margin-left:12px;padding:6px 14px;background:#0d6efd;color:white;text-decoration:none;border-radius:4px"
+              >Open Labelary</a>
+          </body></html>
+        `);
+      }
+
+      log("📄 ZPL preview:", zpl);
+    }
+
+    async testLabelFormat() {
+      let productData = this.getCurrentProductData();
+
+      if (!productData.name && !productData.upc) {
+        // Use sample data for testing
+        productData = {
+          name: "TEST PRODUCT",
+          price: "12.99",
+          upc: "123456789012",
+        };
+      }
+
+      this.updateStatus("Sending test label to printer...");
+
+      try {
+        // Test actual Zebra printing with sample data
+        await this.printViaZebra(productData);
+        this.updateStatus("✅ Test label sent to printer!", "success");
+        log("🧪 Test label printed with data:", productData);
+      } catch (error) {
+        this.updateStatus("❌ Test print failed - showing ZPL", "error");
+        log("Test print error:", error);
+
+        // Show ZPL commands for debugging
+        const zplCommands = this.createZPLCommands(productData);
+        log("Generated ZPL for debugging:", zplCommands);
+
+        // Create a debug window with ZPL commands
+        const debugWindow = window.open("", "_blank", "width=600,height=500");
+        if (debugWindow) {
+          debugWindow.document.write(`
+            <html>
+            <head><title>ZPL Test Commands</title></head>
+            <body style="font-family:Arial;padding:20px;background:#f5f5f5;">
+              <h2>🦓 Zebra ZPL Test Commands</h2>
+              <p><strong>Product:</strong> ${productData.name}</p>
+              <p><strong>Price:</strong> $${productData.price}</p>
+              <p><strong>UPC:</strong> ${productData.upc}</p>
+              <hr>
+              <h3>Copy these ZPL commands:</h3>
+              <textarea style="width:100%;height:250px;font-family:monospace;font-size:12px;">${zplCommands}</textarea>
+              <hr>
+              <p><strong>Instructions:</strong></p>
+              <ol>
+                <li>Copy the ZPL commands above</li>
+                <li>Open Zebra printer utility or direct connection</li>
+                <li>Send these commands to your Zebra printer</li>
+                <li>Or save as .zpl file and send to printer</li>
+              </ol>
+              <button onclick="navigator.clipboard.writeText('${zplCommands.replace(/'/g, "\\'")}').then(() => alert('ZPL copied to clipboard!'))">📋 Copy ZPL</button>
+            </body>
+            </html>
+          `);
+        }
+      }
+    }
+
+    async testLabelWithSettings(modal) {
+      // Get settings from modal
+      const settings = {
+        dpi:        modal.querySelector("#label-dpi").value,
+        width:      modal.querySelector("#label-width").value,
+        height:     modal.querySelector("#label-height").value,
+        storeNameFontDots: modal.querySelector("#store-name-font-size").value,
+        nameSize:   modal.querySelector("#name-font-size").value,
+        priceSize:  modal.querySelector("#price-font-size").value,
+        labelShift:        modal.querySelector("#label-shift").value,
+        labelTop:          modal.querySelector("#label-top").value,
+        darkness:          modal.querySelector("#label-darkness").value,
+        printSpeed:          modal.querySelector("#label-speed").value,
+        storeName:           modal.querySelector("#label-store-name").value.trim(),
+        barcodeModuleWidth:  modal.querySelector("#barcode-module-width").value,
+        barcodeHeightDots:   modal.querySelector("#barcode-height-dots").value,
+      };
+
+      const productData = this.getCurrentProductData() || {
+        name: "SETTINGS TEST",
+        price: "12.99",
+        upc: "123456789012",
+      };
+
+      this.updateStatus("Testing custom settings on printer...");
+
+      try {
+        // Create custom ZPL with settings
+        const customZPL = this.createCustomZPL(productData, settings);
+
+        // Test actual printing with custom settings
+        await this.sendZPL(customZPL);
+        this.updateStatus("✅ Custom settings test printed!", "success");
+      } catch (error) {
+        this.updateStatus("❌ Custom settings test failed", "error");
+        log("Custom settings test error:", error);
+      }
+    }
+
+    resetPrintSettings(modal) {
+      const d = this.defaultPrintSettings();
+      modal.querySelector("#label-dpi").value          = String(d.dpi);
+      modal.querySelector("#label-width").value         = d.widthIn;
+      modal.querySelector("#label-height").value        = d.heightIn;
+      modal.querySelector("#store-name-font-size").value = d.storeNameFontDots;
+      modal.querySelector("#name-font-size").value        = d.nameFontDots;
+      modal.querySelector("#price-font-size").value       = d.priceFontDots;
+      modal.querySelector("#label-shift").value         = d.labelShift;
+      modal.querySelector("#label-top").value           = d.labelTop;
+      modal.querySelector("#label-darkness").value          = d.darkness;
+      modal.querySelector("#label-speed").value             = d.printSpeed;
+      modal.querySelector("#label-store-name").value        = d.storeName;
+      modal.querySelector("#barcode-module-width").value   = d.barcodeModuleWidth;
+      modal.querySelector("#barcode-height-dots").value    = d.barcodeHeightDots;
+      modal.querySelector("#pricing-factor").value         = (d.pricingFactor ?? 0.85).toFixed(2);
+      this.updateStatus("Settings reset to default");
+    }
+
+    savePrintSettings(modal) {
+      const dpi          = parseInt(modal.querySelector("#label-dpi").value, 10);
+      const widthIn      = parseFloat(modal.querySelector("#label-width").value);
+      const heightIn     = parseFloat(modal.querySelector("#label-height").value);
+      const storeNameFontDots= parseInt(modal.querySelector("#store-name-font-size").value, 10);
+      const nameFontDots      = parseInt(modal.querySelector("#name-font-size").value, 10);
+      const priceFontDots     = parseInt(modal.querySelector("#price-font-size").value, 10);
+      const labelShift        = parseInt(modal.querySelector("#label-shift").value, 10);
+      const labelTop           = parseInt(modal.querySelector("#label-top").value, 10);
+      const darkness           = parseInt(modal.querySelector("#label-darkness").value, 10);
+      const printSpeed         = parseInt(modal.querySelector("#label-speed").value, 10);
+      const storeName          = modal.querySelector("#label-store-name").value.trim();
+      const barcodeModuleWidth = parseFloat(modal.querySelector("#barcode-module-width").value);
+      const barcodeHeightDots  = parseInt(modal.querySelector("#barcode-height-dots").value, 10);
+      const pricingFactor      = parseFloat(modal.querySelector("#pricing-factor").value) || 0.85;
+
+      this.printSettings = Object.assign({}, this.printSettings, {
+        dpi, widthIn, heightIn, storeNameFontDots, nameFontDots, priceFontDots,
+        labelShift, labelTop, darkness, printSpeed, storeName,
+        barcodeModuleWidth, barcodeHeightDots, pricingFactor,
+      });
+
+      this.savePrintSettingsToStorage();
+      this.updateStatus("Print settings saved", "success");
+      modal.style.opacity = "0";
+      setTimeout(() => modal.remove(), 300);
+    }
+
+    _updateQtyLabel() {
+      const el = document.getElementById("pm-qty-label");
+      if (el) el.textContent = this.printQty === 1 ? "label" : `labels (×${this.printQty})`;
+    }
+
+    togglePanel() {
+      if (this.controlPanel.style.display === "none") {
+        this.controlPanel.style.display = "block";
+        document.getElementById("pm-toggle-panel").textContent = "Hide";
+      } else {
+        this.controlPanel.style.display = "none";
+        // Create a show button
+        this.createShowButton();
+      }
+    }
+
+    createShowButton() {
+      if (document.getElementById("pm-show-btn")) return;
+
+      const showBtn = document.createElement("button");
+      showBtn.id = "pm-show-btn";
+      showBtn.textContent = "Show PM Control";
+      showBtn.style.cssText = `
+                position: fixed;
+                top: 10px;
+                right: 10px;
+                z-index: 10001;
+                padding: 5px 10px;
+                background: #007bff;
+                color: white;
+                border: none;
+                border-radius: 4px;
+                cursor: pointer;
+            `;
+
+      showBtn.addEventListener("click", () => {
+        this.controlPanel.style.display = "block";
+        document.getElementById("pm-toggle-panel").textContent = "Hide";
+        showBtn.remove();
+      });
+
+      document.body.appendChild(showBtn);
+    }
+
+    setupBarcodeDetection() {
+      const trySetup = () => {
+        const upcField = this.findUpcField();
+
+        if (upcField && !upcField.dataset.pmBound) {
+          upcField.dataset.pmBound = "true";
+          log("✅ Binding barcode detection to UPC field:", upcField);
+
+        // Monitor for rapid input (typical of barcode scanners)
+        upcField.addEventListener("input", (e) => {
+          const currentValue = e.target.value;
+          log(`📝 UPC field input detected: "${currentValue}"`);
+
+          // Skip if already processing
+          if (this.processingBarcode) {
+            log(`🚫 Already processing barcode, skipping input event`);
+            return;
+          }
+
+          // Clear previous timeout
+          if (this.scanTimeout) {
+            clearTimeout(this.scanTimeout);
+          }
+
+          // Set timeout to detect end of scan
+          this.scanTimeout = setTimeout(() => {
+            log(
+              `⏱️ Input timeout reached, processing barcode: "${currentValue}"`,
+            );
+            this.handleBarcodeInput(currentValue);
+          }, 300); // Increased to 300ms for Windows compatibility
+        });
+
+        // Also monitor for Enter key (some scanners send Enter)
+        upcField.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") {
+            log(`⌨️ Enter key detected in UPC field`);
+            e.preventDefault();
+            const currentValue = e.target.value;
+
+            // Skip if already processing
+            if (this.processingBarcode) {
+              log(`🚫 Already processing barcode, skipping Enter event`);
+              return;
+            }
+
+            // Clear timeout since we're handling immediately
+            if (this.scanTimeout) {
+              clearTimeout(this.scanTimeout);
+            }
+            setTimeout(() => {
+              log(`⚡ Processing barcode via Enter key: "${currentValue}"`);
+              this.handleBarcodeInput(currentValue);
+            }, 100);
+          }
+        });
+
+          // Remove change event - was causing double prints on refocus
+
+          return true;
+        }
+        return false;
+      };
+
+      if (trySetup()) return;
+
+      // Initial setup failed (field not in DOM yet) — watch for it
+      log("⏳ UPC field not present yet, watching for it...");
+      const observer = new MutationObserver(() => { trySetup(); });
+      observer.observe(document.body, { childList: true, subtree: true });
+
+      // Heartbeat: re-bind after Angular route changes destroy/recreate the UPC field.
+      // The observer above disconnects once it fires, but Angular SPA navigation can
+      // swap in an entirely new DOM node; the heartbeat catches that case.
+      setInterval(() => { trySetup(); }, 3000);
+    }
+
+    clearProductFields() {
+      try {
+        // UPC field intentionally not cleared — the scanner owns that field
+        const nameField =
+          document.querySelector('input[placeholder="Enter product description"]') ||
+          document.querySelector('textarea[name="stringAreaCtrl"]') ||
+          document.querySelector("string-area-picker textarea");
+        if (nameField) nameField.value = "";
+
+        const priceField =
+          document.querySelector("#unit-price") ||
+          document.querySelector('money-picker input[id="unit-price"]');
+        if (priceField) priceField.value = "";
+
+        const costField =
+          document.querySelector("#cost") ||
+          document.querySelector('money-picker input[id="cost"]');
+        if (costField) costField.value = "";
+
+        log("🧹 Cleared product fields for new scan");
+      } catch (error) {
+        log("Error clearing product fields:", error);
+      }
+    }
+
+    async handleBarcodeInput(upcValue) {
+      if (!upcValue || upcValue === this.lastUpcValue) {
+        log(
+          `Skipping barcode input: empty=${!upcValue}, duplicate=${upcValue === this.lastUpcValue}`,
+        );
+        return;
+      }
+
+      // Prevent concurrent processing
+      if (this.processingBarcode) {
+        log(`🚫 Already processing barcode: ${upcValue}, skipping`);
+        return;
+      }
+
+      // Set processing flag and last UPC immediately
+      this.processingBarcode = true;
+      this.lastUpcValue = upcValue;
+      log(
+        `🔍 Barcode detected: ${upcValue}, Auto-print enabled: ${this.autoPrintEnabled}`,
+      );
+
+      try {
+        // Check if this looks like a barcode (all digits, reasonable length)
+        if (/^\d{8,14}$/.test(upcValue)) {
+          this.updateStatus(`Scanned: ${upcValue}`);
+
+          // Clear existing product data from UI fields
+          this.clearProductFields();
+
+          // Give the system time to process the scan before polling
+          await sleep(300);
+
+          // Poll for product data to load
+          const currentData = await this.pollForProductData(upcValue);
+
+          if (currentData) {
+            // Check if this is a different product than last scan BEFORE clearing
+            const isNewProduct =
+              !this.lastProductData ||
+              this.lastProductData.upc !== currentData.upc ||
+              this.lastProductData.name !== currentData.name;
+
+            // Now update the stored product data
+            this.lastProductData = currentData;
+
+            if (isNewProduct) {
+              this.updateStatus(`✅ NEW: ${currentData.name}`, "success");
+              log(
+                `✅ NEW product loaded: Name="${currentData.name}", Price="${currentData.price}", UPC="${currentData.upc}"`,
+              );
+            } else {
+              this.updateStatus(`🔄 SAME: ${currentData.name}`, "success");
+              log(
+                `🔄 Same product rescanned: Name="${currentData.name}", Price="${currentData.price}", UPC="${currentData.upc}"`,
+              );
+            }
+
+            // Auto-print if enabled — only for genuinely new/different items
+            if (this.autoPrintEnabled) {
+              if (isNewProduct) {
+                  log(`🖨️ Auto-print is enabled, printing new product (qty=${this.printQty})…`);
+                  try {
+                    await this.printCurrentProduct(currentData, this.printQty);
+                    log("✅ Auto-print completed successfully");
+                } catch (error) {
+                  log(`❌ Auto-print failed:`, error);
+                  this.updateStatus(`Print failed: ${error.message}`);
+                }
+              } else {
+                log("⏭️ Same item as last scan — skipping auto-print to avoid duplicate");
+                this.updateStatus(`🔄 Already printed: ${currentData.name}`);
+              }
+            }
+          } else {
+            this.lastProductData = null;
+            if (this.isProductNotFound()) {
+              log(`🔍 Out-of-system item: ${upcValue} — showing research modal`);
+              this.updateStatus(`⚠️ Not in system: ${upcValue}`);
+              this.showProductResearchModal(upcValue);
+            } else {
+              this.updateStatus(`❌ No data for UPC: ${upcValue}`);
+              log(`❌ No data found for UPC: ${upcValue}, auto-print will be skipped`);
+            }
+          }
+        } else {
+          this.updateStatus(`❌ Invalid barcode format: ${upcValue}`);
+          this.processingBarcode = false;
+        }
+      } catch (error) {
+        log("Error in handleBarcodeInput:", error);
+        this.updateStatus("Error processing barcode");
+      } finally {
+        // Always clear processing flag when done
+        this.processingBarcode = false;
+      }
+    }
+
+    // ── Product Research ──────────────────────────────────────────────────────
+
+    // Tries Open Food Facts first (free, no key), falls back to UPCitemdb trial.
+    async lookupProductByUPC(upc) {
+      // Open Food Facts
+      try {
+        const res = await this.gmRequest({
+          method: 'GET',
+          url: `https://world.openfoodfacts.org/api/v2/product/${upc}.json?fields=product_name,brands,categories,quantity`,
+          headers: { 'User-Agent': 'MarktPOS-Lookup/1.0' },
+          timeout: 8000,
+        });
+        if (res.status === 200) {
+          const d = JSON.parse(res.responseText);
+          if (d.status === 1 && d.product) {
+            const p = d.product;
+            return {
+              source: 'Open Food Facts',
+              name: p.product_name || '',
+              brand: p.brands || '',
+              category: (p.categories || '').split(',')[0].trim(),
+              quantity: p.quantity || '',
+            };
+          }
+        }
+      } catch (e) { log('Open Food Facts lookup failed:', e); }
+
+      // UPCitemdb trial fallback
+      try {
+        const res = await this.gmRequest({
+          method: 'GET',
+          url: `https://api.upcitemdb.com/prod/trial/lookup?upc=${upc}`,
+          timeout: 8000,
+        });
+        if (res.status === 200) {
+          const d = JSON.parse(res.responseText);
+          if (d.code === 'OK' && d.items?.length) {
+            const item = d.items[0];
+            return {
+              source: 'UPCitemdb',
+              name: item.title || '',
+              brand: item.brand || '',
+              category: item.category || '',
+              quantity: item.size || '',
+              priceMin: item.lowest_recorded_price  || null,
+              priceMax: item.highest_recorded_price || null,
+            };
+          }
+        }
+      } catch (e) { log('UPCitemdb lookup failed:', e); }
+
+      return null;
+    }
+
+    // ── Quick New Item Modal ───────────────────────────────────────────────────
+    // Full-featured new-item creation flow: product info, AI-suggested pricing,
+    // margin calculator, market research links, and batch print.
+    showProductResearchModal(upc) {
+      const existing = document.getElementById('pm-research-modal');
+      if (existing) existing.remove();
+
+      const factor = this.printSettings.pricingFactor ?? 0.85;
+      const q = encodeURIComponent(upc);
+      const linkStyle = 'padding:4px 10px;background:#0d6efd;color:white;border-radius:4px;text-decoration:none;font-size:12px;';
+
+      // ── section helper ──
+      const sec = (title, body) => `
+        <div style="border:1px solid #e0e0e0;border-radius:6px;padding:12px 14px;margin-bottom:10px;">
+          <div style="font-size:11px;font-weight:700;color:#555;text-transform:uppercase;letter-spacing:.6px;margin-bottom:10px;">${title}</div>
+          ${body}
+        </div>`;
+
+      const inp = (id, type, placeholder, extra='') =>
+        `<input id="${id}" type="${type}" placeholder="${placeholder}" ${extra}
+          style="width:100%;box-sizing:border-box;padding:6px 8px;border:1px solid #ccc;border-radius:4px;font-size:13px;margin-top:3px;">`;
+
+      const row = (label, field) =>
+        `<label style="display:block;font-size:12px;color:#444;margin-bottom:7px;">${label}${field}</label>`;
+
+      const modal = document.createElement('div');
+      modal.id = 'pm-research-modal';
+      modal.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.65);z-index:10002;display:flex;align-items:center;justify-content:center;';
+
+      modal.innerHTML = `
+        <div style="background:#fff;border-radius:10px;max-width:460px;width:94%;max-height:90vh;overflow-y:auto;position:relative;padding:20px 18px 18px;">
+          <button id="pm-research-close"
+            style="position:absolute;top:10px;right:12px;background:none;border:none;font-size:22px;cursor:pointer;color:#888;line-height:1;">&times;</button>
+
+          <h3 style="margin:0 0 2px;color:#c0392b;font-size:16px;">🆕 New Item Setup</h3>
+          <p style="margin:0 0 12px;font-size:12px;color:#777;">UPC not in system &mdash; <strong>${upc}</strong></p>
+
+          ${sec('📦 Product Info',
+            `<div id="pm-r-lookup-status" style="font-size:12px;color:#aaa;margin-bottom:8px;">⏳ Looking up product…</div>
+             ${row('Name', inp('pm-r-name','text','Product name'))}
+             <div style="display:flex;gap:8px;">
+               <label style="flex:1;font-size:12px;color:#444;">Brand
+                 ${inp('pm-r-brand','text','Brand')}</label>
+               <label style="flex:1;font-size:12px;color:#444;">Size / Qty
+                 ${inp('pm-r-size','text','e.g. 12 oz')}</label>
+             </div>`
+          )}
+
+          ${sec('💰 AI Pricing',
+            `<div id="pm-r-market-row" style="display:none;background:#f0f7ff;border-radius:5px;padding:8px 10px;margin-bottom:10px;">
+               <span style="font-size:12px;color:#444;">Market range: </span>
+               <strong id="pm-r-market-range" style="font-size:13px;"></strong>
+               <span style="font-size:12px;color:#666;"> &nbsp;·&nbsp; Suggested at
+                 <input id="pm-r-factor" type="number" min="0.1" max="3" step="0.05" value="${factor}"
+                   style="width:52px;padding:2px 4px;font-size:12px;border:1px solid #bbb;border-radius:3px;text-align:center;"> ×
+               </span>
+               <button id="pm-r-apply-ai"
+                 style="display:inline-block;margin-left:6px;padding:3px 10px;font-size:12px;background:#198754;color:white;border:none;border-radius:4px;cursor:pointer;">
+                 Use <span id="pm-r-ai-price"></span> ✓
+               </button>
+             </div>
+             <div style="display:flex;gap:8px;align-items:flex-end;">
+               <label style="flex:1;font-size:12px;color:#444;">Your Price ($)
+                 <input id="pm-r-price" type="number" step="0.01" min="0" placeholder="0.00"
+                   style="width:100%;box-sizing:border-box;padding:7px 8px;border:2px solid #28a745;border-radius:4px;font-size:16px;font-weight:700;margin-top:3px;"></label>
+               <label style="flex:1;font-size:12px;color:#444;">Cost ($) <em style="font-size:10px;color:#aaa;">(optional)</em>
+                 <input id="pm-r-cost" type="number" step="0.01" min="0" placeholder="0.00"
+                   style="width:100%;box-sizing:border-box;padding:7px 8px;border:1px solid #ccc;border-radius:4px;font-size:14px;margin-top:3px;"></label>
+             </div>
+             <div id="pm-r-margin" style="font-size:12px;color:#555;margin-top:7px;min-height:18px;"></div>`
+          )}
+
+          <details style="margin-bottom:10px;">
+            <summary style="font-size:12px;font-weight:700;color:#555;text-transform:uppercase;letter-spacing:.6px;cursor:pointer;user-select:none;">
+              🔍 Market Research Links
+            </summary>
+            <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;">
+              <a href="https://www.google.com/search?q=${q}" target="_blank" style="${linkStyle}">Google</a>
+              <a href="https://www.amazon.com/s?k=${q}" target="_blank" style="${linkStyle}">Amazon</a>
+              <a href="https://www.walmart.com/search?q=${q}" target="_blank" style="${linkStyle}">Walmart</a>
+              <a href="https://www.instacart.com/store/search_v3/term?term=${q}" target="_blank" style="${linkStyle}">Instacart</a>
+              <a href="https://www.barcodelookup.com/${upc}" target="_blank" style="${linkStyle}">Barcode Lookup</a>
+            </div>
+          </details>
+
+          <div style="display:flex;align-items:center;gap:8px;border-top:1px solid #eee;padding-top:14px;">
+            <span style="font-size:12px;color:#555;white-space:nowrap;">Labels:</span>
+            <button id="pm-r-qty-dec" style="padding:4px 10px;font-size:15px;border:1px solid #ccc;border-radius:4px;background:#f5f5f5;cursor:pointer;">−</button>
+            <input id="pm-r-qty" type="number" min="1" max="999" value="${this.printQty}"
+              style="width:48px;text-align:center;padding:4px;font-size:14px;border:1px solid #ccc;border-radius:4px;">
+            <button id="pm-r-qty-inc" style="padding:4px 10px;font-size:15px;border:1px solid #ccc;border-radius:4px;background:#f5f5f5;cursor:pointer;">+</button>
+            <button id="pm-research-print"
+              style="flex:1;padding:9px 0;background:#28a745;color:white;border:none;border-radius:5px;cursor:pointer;font-size:14px;font-weight:600;">
+              🖨️ Print Label
+            </button>
+          </div>
+        </div>
+      `;
+
+      document.body.appendChild(modal);
+
+      // ── close ──
+      modal.querySelector('#pm-research-close').addEventListener('click', () => modal.remove());
+      modal.addEventListener('click', (e) => { if (e.target === modal) modal.remove(); });
+
+      // ── qty stepper (mirrors main panel qty) ──
+      const qtyInput = modal.querySelector('#pm-r-qty');
+      modal.querySelector('#pm-r-qty-dec').addEventListener('click', () => {
+        qtyInput.value = Math.max(1, parseInt(qtyInput.value||'1',10) - 1);
+      });
+      modal.querySelector('#pm-r-qty-inc').addEventListener('click', () => {
+        qtyInput.value = Math.min(999, parseInt(qtyInput.value||'1',10) + 1);
+      });
+
+      // ── live margin calculator ──
+      const priceInput = modal.querySelector('#pm-r-price');
+      const costInput  = modal.querySelector('#pm-r-cost');
+      const marginEl   = modal.querySelector('#pm-r-margin');
+      const recalcMargin = () => {
+        const p = parseFloat(priceInput.value);
+        const c = parseFloat(costInput.value);
+        if (!isNaN(p) && p > 0 && !isNaN(c) && c >= 0) {
+          const margin = ((p - c) / p * 100).toFixed(1);
+          const markup = ((p - c) / (c || 1) * 100).toFixed(1);
+          const color  = margin >= 30 ? '#198754' : margin >= 15 ? '#856404' : '#dc3545';
+          marginEl.innerHTML = `<span style="color:${color};font-weight:600;">Margin ${margin}%</span> &nbsp;·&nbsp; Markup ${markup}%`;
+        } else {
+          marginEl.textContent = '';
+        }
+      };
+      priceInput.addEventListener('input', recalcMargin);
+      costInput.addEventListener('input', recalcMargin);
+
+      // ── AI pricing: factor input recalculates suggested price ──
+      const factorInput  = modal.querySelector('#pm-r-factor');
+      const aiPriceSpan  = modal.querySelector('#pm-r-ai-price');
+      const marketRowEl  = modal.querySelector('#pm-r-market-row');
+      let _marketHigh    = null;
+      const recalcSuggested = () => {
+        if (_marketHigh == null) return;
+        const f = parseFloat(factorInput.value) || factor;
+        const suggested = (_marketHigh * f).toFixed(2);
+        aiPriceSpan.textContent = `$${suggested}`;
+        return suggested;
+      };
+      factorInput.addEventListener('input', recalcSuggested);
+      modal.querySelector('#pm-r-apply-ai').addEventListener('click', () => {
+        const v = recalcSuggested();
+        if (v) { priceInput.value = v; recalcMargin(); }
+      });
+
+      // ── print button ──
+      modal.querySelector('#pm-research-print').addEventListener('click', async () => {
+        const name  = modal.querySelector('#pm-r-name').value.trim();
+        const price = priceInput.value.trim();
+        const qty   = Math.max(1, parseInt(qtyInput.value||'1',10));
+        if (!name)                     { alert('Please enter a product name.'); return; }
+        if (!this.isValidPrice(price)) { alert('Please enter a valid price.'); return; }
+        // Sync qty back to main panel
+        this.printQty = qty;
+        const panelQty = document.getElementById('pm-qty');
+        if (panelQty) panelQty.value = qty;
+        this._updateQtyLabel();
+        // Save factor preference
+        const f = parseFloat(factorInput.value);
+        if (!isNaN(f) && f > 0) {
+          this.printSettings.pricingFactor = f;
+          this.savePrintSettingsToStorage();
+        }
+        modal.remove();
+        await this.printCurrentProduct({ name, price, upc }, qty);
+      });
+
+      // ── async lookup — populates fields when data arrives ──
+      this.lookupProductByUPC(upc).then(info => {
+        const statusEl = document.getElementById('pm-r-lookup-status');
+        if (!statusEl) return; // modal closed
+        if (info) {
+          statusEl.textContent = `✅ Found via ${info.source}`;
+          const nameInput  = document.getElementById('pm-r-name');
+          const brandInput = document.getElementById('pm-r-brand');
+          const sizeInput  = document.getElementById('pm-r-size');
+          if (nameInput  && info.name     && !nameInput.value)  nameInput.value  = info.name;
+          if (brandInput && info.brand    && !brandInput.value) brandInput.value = info.brand;
+          if (sizeInput  && info.quantity && !sizeInput.value)  sizeInput.value  = info.quantity;
+
+          // AI pricing row
+          if (info.priceMin != null || info.priceMax != null) {
+            _marketHigh = info.priceMax ?? info.priceMin;
+            const rangeEl = document.getElementById('pm-r-market-range');
+            if (rangeEl) {
+              rangeEl.textContent = (info.priceMin != null && info.priceMax != null)
+                ? `$${info.priceMin.toFixed(2)} – $${info.priceMax.toFixed(2)}`
+                : `$${(_marketHigh).toFixed(2)}`;
+            }
+            if (marketRowEl) marketRowEl.style.display = 'block';
+            recalcSuggested();
+          }
+        } else {
+          statusEl.textContent = '⚠️ Not found in product databases — fill in manually';
+        }
+      }).catch(() => {
+        const statusEl = document.getElementById('pm-r-lookup-status');
+        if (statusEl) statusEl.textContent = '⚠️ Lookup failed — fill in manually';
+      });
+    }
+
+    toggleAutoPrint() {
+      this.autoPrintEnabled = !this.autoPrintEnabled;
+      const button = document.getElementById("pm-toggle-autoprint");
+      if (button) {
+        button.textContent = `Auto-Print: ${this.autoPrintEnabled ? "ON" : "OFF"}`;
+        button.style.background = this.autoPrintEnabled ? "#28a745" : "#6c757d";
+      }
+
+      this.updateStatus(
+        `Auto-print ${this.autoPrintEnabled ? "enabled" : "disabled"}`,
+      );
+      log(`🖨️ Auto-print ${this.autoPrintEnabled ? "enabled" : "disabled"}`);
+
+      // Store preference
+      try {
+        localStorage.setItem(
+          "pm-autoprint-enabled",
+          this.autoPrintEnabled.toString(),
+        );
+        log(`💾 Auto-print preference saved: ${this.autoPrintEnabled}`);
+      } catch (error) {
+        log(`❌ Could not save auto-print preference:`, error);
+      }
+    }
+
+    async checkPrintCapabilities() {
+      try {
+        const printers = await this.listBrowserPrintPrinters();
+        if (printers.length > 0) {
+          log("✅ Browser Print agent found printers:", printers.map(p => p.name));
+          this.updateStatus(`✅ Printer ready (${printers[0].name || "unknown"})`, "success");
+        } else {
+          this.updateStatus("⚠️ Browser Print agent running but no printers found");
+        }
+      } catch (error) {
+        log("⚠️ Browser Print agent not reachable:", error.message);
+        this.updateStatus("⚠️ Zebra agent not reachable - is Browser Print running?");
+      }
+    }
+
+    async testPrintServer() {
+      this.updateStatus("Testing printer connection...");
+
+      try {
+        const testData = {
+          name: "CONNECTION TEST",
+          price: "$99.99",
+          upc: "999999999999",
+        };
+
+        log("🧪 Testing printer with data:", testData);
+        await this.printViaZebra(testData);
+        this.updateStatus("✅ Printer test successful!", "success");
+      } catch (error) {
+        this.updateStatus("❌ Printer test failed: " + error.message, "error");
+        log("Printer test failed:", error);
+        await this.checkPrintCapabilities();
+      }
+    }
+
+    showAbout() {
+      // Remove existing modal if present
+      const existingModal = document.getElementById("pm-about-modal");
+      if (existingModal) {
+        existingModal.remove();
+      }
+
+      const modal = document.createElement("div");
+      modal.id = "pm-about-modal";
+      modal.innerHTML = `
+        <div id="pm-about-content">
+          <button class="about-close-btn">&times;</button>
+          <h2>Product Maintenance Automation Tool</h2>
+          <p><strong>Developed by instance.select</strong></p>
+
+          <h3>📋 Overview</h3>
+          <p>This userscript automates product maintenance tasks including barcode scanning, label printing, and data management for Zebra label printers.</p>
+
+          <h3>⌨️ Keyboard Shortcuts</h3>
+          <ul>
+            <li><code>Ctrl+P</code> - Print current product label</li>
+            <li><code>Ctrl+U</code> - Focus UPC field</li>
+            <li><code>Ctrl+M</code> - Market research lookup</li>
+            <li><code>Ctrl+L</code> - UPC lookup</li>
+          </ul>
+
+          <h3>🔄 Auto-Print Feature</h3>
+          <p>When enabled, the tool automatically prints labels when barcodes are scanned. The system:</p>
+          <ul>
+            <li>Detects barcode input in the UPC field</li>
+            <li>Waits for product data to load</li>
+            <li>Automatically sends print request to printer</li>
+            <li>Provides status feedback throughout the process</li>
+          </ul>
+
+          <h3>🏷️ Label / Printer Settings</h3>
+          <p>Use "Print Settings & Test" to set your DPI and label size (default: 1.5" x 1"). Unsure of your printer's DPI? Use "Print Config Label" to print a diagnostic label straight from the printer showing its real resolution.</p>
+
+          <h3>🛠️ Troubleshooting</h3>
+          <ul>
+            <li><strong>No printers found:</strong> Make sure the Zebra Browser Print app is running in your system tray, and that it has accepted this site in its "Allowed Hosts" list (it will prompt on first connect)</li>
+            <li><strong>Test print fails:</strong> Check that the printer is powered on and the Browser Print agent can see it</li>
+            <li><strong>Barcode not detected:</strong> Ensure UPC field is properly focused and scanner is configured</li>
+            <li><strong>Label content spills onto the next label:</strong> Your DPI setting doesn't match the printer's actual resolution - print a Config Label to check, then update it in Print Settings</li>
+          </ul>
+        </div>
+      `;
+
+      document.body.appendChild(modal);
+
+      // Show modal
+      setTimeout(() => {
+        modal.classList.add("show");
+      }, 10);
+
+      // Close button event
+      modal.querySelector(".about-close-btn").addEventListener("click", () => {
+        modal.classList.remove("show");
+        setTimeout(() => modal.remove(), 300);
+      });
+
+      // Click outside to close
+      modal.addEventListener("click", (e) => {
+        if (e.target === modal) {
+          modal.classList.remove("show");
+          setTimeout(() => modal.remove(), 300);
+        }
+      });
+    }
+  }
+
+  // Initialize the automation
+  function initializeScript() {
+    log("Starting Product Maintenance Automation...");
+
+    // Wait for DOM to be ready
+    if (document.readyState === "loading") {
+      document.addEventListener("DOMContentLoaded", () => {
+        setTimeout(() => new ProductMaintenanceAutomation().init(), 1000);
+      });
+    } else {
+      setTimeout(() => new ProductMaintenanceAutomation().init(), 1000);
+    }
+  }
+
+  // Start the script
+  initializeScript();
+})();
