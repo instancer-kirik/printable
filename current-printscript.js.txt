@@ -1776,6 +1776,27 @@
         if (/^\d{8,14}$/.test(upcValue)) {
           this.updateStatus(`Scanned: ${upcValue}`);
 
+          // Fast path: same product rescanned — reuse cached data so we don't
+          // clear the fields and then poll for data the app won't re-fetch.
+          const cachedMatch = this.lastProductData &&
+            this._normaliseUpc(this.lastProductData.upc) === this._normaliseUpc(upcValue);
+
+          if (cachedMatch) {
+            log(`🔄 Repeat scan of same product — using cached data`);
+            this.updateStatus(`🔄 ${this.lastProductData.name}`, "success");
+            if (this.autoPrintEnabled) {
+              log(`🖨️ Auto-print (repeat) printing (qty=${this.printQty})…`);
+              try {
+                await this.printCurrentProduct(this.lastProductData, this.printQty);
+                log("✅ Auto-print (repeat) completed");
+              } catch (error) {
+                log(`❌ Auto-print (repeat) failed:`, error);
+                this.updateStatus(`Print failed: ${error.message}`);
+              }
+            }
+            return;
+          }
+
           // Clear existing product data from UI fields
           this.clearProductFields();
 
