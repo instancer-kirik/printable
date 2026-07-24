@@ -33,6 +33,7 @@
       this.scanTimeout = null;
       this.lastProductData = null;
       this.processingBarcode = false;
+      this.lastUpcTime = 0;   // epoch ms of last accepted scan — used for time-based dedup
       this.printQty = 1;  // batch label quantity — shared by manual print and auto-print
 
       // Restore auto-print preference
@@ -378,7 +379,7 @@
                     <div class="status" id="pm-status">Ready</div>
                     <div class="button-group" style="align-items:center;">
                         <button id="pm-print-current" class="print-btn" title="Print current product label (Ctrl+P)">Print Label</button>
-                        <button id="pm-focus-upc" title="Focus UPC field">Focus UPC</button>
+                        <button id="pm-focus-upc" title="Focus UPC field (Ctrl+U)">Focus UPC</button>
                     </div>
                     <div class="button-group" style="align-items:center;gap:4px;">
                         <span style="font-size:11px;white-space:nowrap;">Qty:</span>
@@ -1750,12 +1751,13 @@
     }
 
     async handleBarcodeInput(upcValue) {
-      if (!upcValue || upcValue === this.lastUpcValue) {
-        log(
-          `Skipping barcode input: empty=${!upcValue}, duplicate=${upcValue === this.lastUpcValue}`,
-        );
+      const now = Date.now();
+      const recentDup = upcValue === this.lastUpcValue && (now - this.lastUpcTime) < 1500;
+      if (!upcValue || recentDup) {
+        log(`Skipping barcode input: empty=${!upcValue}, recentDup=${recentDup}`);
         return;
       }
+      this.lastUpcTime = now;
 
       // Prevent concurrent processing
       if (this.processingBarcode) {
@@ -1806,20 +1808,15 @@
               );
             }
 
-            // Auto-print if enabled — only for genuinely new/different items
+            // Auto-print if enabled — fires on every accepted scan (dedup handled by 1.5s time gate above)
             if (this.autoPrintEnabled) {
-              if (isNewProduct) {
-                  log(`🖨️ Auto-print is enabled, printing new product (qty=${this.printQty})…`);
-                  try {
-                    await this.printCurrentProduct(currentData, this.printQty);
-                    log("✅ Auto-print completed successfully");
-                } catch (error) {
-                  log(`❌ Auto-print failed:`, error);
-                  this.updateStatus(`Print failed: ${error.message}`);
-                }
-              } else {
-                log("⏭️ Same item as last scan — skipping auto-print to avoid duplicate");
-                this.updateStatus(`🔄 Already printed: ${currentData.name}`);
+              log(`🖨️ Auto-print printing (qty=${this.printQty})…`);
+              try {
+                await this.printCurrentProduct(currentData, this.printQty);
+                log("✅ Auto-print completed successfully");
+              } catch (error) {
+                log(`❌ Auto-print failed:`, error);
+                this.updateStatus(`Print failed: ${error.message}`);
               }
             }
           } else {
