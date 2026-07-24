@@ -34,6 +34,7 @@
       this.lastProductData = null;
       this.processingBarcode = false;
       this.lastUpcTime = 0;   // epoch ms of last accepted scan — used for time-based dedup
+      this.boundUpcField = null; // reference to the currently bound UPC input element
       this.printQty = 1;  // batch label quantity — shared by manual print and auto-print
 
       // Restore auto-print preference
@@ -1652,8 +1653,9 @@
       const trySetup = () => {
         const upcField = this.findUpcField();
 
-        if (upcField && !upcField.dataset.pmBound) {
-          upcField.dataset.pmBound = "true";
+        // Rebind whenever the field reference changes (Angular route navigation gives a new element)
+        if (upcField && upcField !== this.boundUpcField) {
+          this.boundUpcField = upcField;
           log("✅ Binding barcode detection to UPC field:", upcField);
 
         // Monitor for rapid input (typical of barcode scanners)
@@ -1712,17 +1714,14 @@
         return false;
       };
 
-      if (trySetup()) return;
+      trySetup();
 
-      // Initial setup failed (field not in DOM yet) — watch for it
-      log("⏳ UPC field not present yet, watching for it...");
+      // Watch for the UPC field to appear (initial load) or change (Angular route navigation).
+      // MutationObserver catches DOM changes; heartbeat catches cases where the element
+      // reference silently changes without a DOM mutation (Angular component reuse).
       const observer = new MutationObserver(() => { trySetup(); });
       observer.observe(document.body, { childList: true, subtree: true });
-
-      // Heartbeat: re-bind after Angular route changes destroy/recreate the UPC field.
-      // The observer above disconnects once it fires, but Angular SPA navigation can
-      // swap in an entirely new DOM node; the heartbeat catches that case.
-      setInterval(() => { trySetup(); }, 3000);
+      setInterval(() => { trySetup(); }, 2000);
     }
 
     clearProductFields() {
