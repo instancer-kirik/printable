@@ -1031,9 +1031,12 @@
       // Code 128C fallback: 101 symbol + 20 quiet zone = 121 modules
       // A 13-digit UPC starting with 0 is an EAN-13 encoding of a UPC-A — strip the leading 0.
       const upcNorm = /^0\d{12}$/.test(upc) ? upc.substring(1) : upc;
-      const isUpcA = /^\d{12}$/.test(upcNorm);
-      log(`🔖 Barcode type: ${isUpcA ? 'UPC-A (^BU)' : 'Code 128 (^BC)'} for UPC="${upc}" → norm="${upcNorm}"`);
-      const TOTAL_MODULES   = isUpcA ? 113 : 121;
+      const isUpcA  = /^\d{12}$/.test(upcNorm);          // 12-digit UPC-A
+      const isEan13 = !isUpcA && /^\d{13}$/.test(upcNorm); // 13-digit EAN-13 (e.g. European 4xxx)
+      const barcodeType = isUpcA ? 'UPC-A (^BU)' : isEan13 ? 'EAN-13 (^BE)' : 'Code 128 (^BC)';
+      log(`🔖 Barcode type: ${barcodeType} for UPC="${upc}" → norm="${upcNorm}"`);
+      // UPC-A and EAN-13 both = 113 modules; Code 128C for 12-digit data = 121 modules
+      const TOTAL_MODULES   = (isUpcA || isEan13) ? 113 : 121;
       // Auto-clamp module width so the barcode never overdraws the label
       while (barcodeModuleWidth > 1 && barcodeModuleWidth * TOTAL_MODULES > fieldW) barcodeModuleWidth--;
       const estBarcodeWidth = barcodeModuleWidth * TOTAL_MODULES;
@@ -1077,10 +1080,12 @@
         zpl += `^BY${barcodeModuleWidth}\n`;
         if (isUpcA) {
           // ^BU expects 11 digits — printer calculates and appends the 12th (check digit)
-          // Sending all 12 digits with e=N produces a garbled barcode; this is the correct form
           zpl += `^FO${barcodeX},${barcodeY}^BUN,${barcodeHeight},Y,N,Y^FD${upcNorm.substring(0, 11)}^FS\n`;
+        } else if (isEan13) {
+          // ^BE for EAN-13 — send all 13 digits, same 113-module width as UPC-A
+          zpl += `^FO${barcodeX},${barcodeY}^BEN,${barcodeHeight},Y,N^FD${upcNorm}^FS\n`;
         } else {
-          // Code 128 for non-UPC-A (EAN-13, UPC-E, etc.)
+          // Code 128 fallback for anything else
           zpl += `^FO${barcodeX},${barcodeY}^BCN,${barcodeHeight},Y,N,N^FD${upcNorm}^FS\n`;
         }
       }
@@ -1133,10 +1138,11 @@
       let barcodeModuleWidth = Math.round(parseFloat(settings.barcodeModuleWidth ?? this.printSettings.barcodeModuleWidth ?? 2));
       // A 13-digit UPC starting with 0 is an EAN-13 encoding of a UPC-A — strip the leading 0.
       const upcNorm = /^0\d{12}$/.test(upc) ? upc.substring(1) : upc;
-      const isUpcA = /^\d{12}$/.test(upcNorm);
-      log(`🔖 Barcode type: ${isUpcA ? 'UPC-A (^BU)' : 'Code 128 (^BC)'} for UPC="${upc}" → norm="${upcNorm}"`);
-      const TOTAL_MODULES   = isUpcA ? 113 : 121;
-      // Auto-clamp module width so the barcode never overdraws the label
+      const isUpcA  = /^\d{12}$/.test(upcNorm);
+      const isEan13 = !isUpcA && /^\d{13}$/.test(upcNorm);
+      const barcodeType = isUpcA ? 'UPC-A (^BU)' : isEan13 ? 'EAN-13 (^BE)' : 'Code 128 (^BC)';
+      log(`🔖 Barcode type: ${barcodeType} for UPC="${upc}" → norm="${upcNorm}"`);
+      const TOTAL_MODULES   = (isUpcA || isEan13) ? 113 : 121;
       while (barcodeModuleWidth > 1 && barcodeModuleWidth * TOTAL_MODULES > fieldWc) barcodeModuleWidth--;
       const estBarcodeWidth = barcodeModuleWidth * TOTAL_MODULES;
 
@@ -1173,6 +1179,8 @@
         zpl += `^BY${barcodeModuleWidth}\n`;
         if (isUpcA) {
           zpl += `^FO${barcodeX},${barcodeY}^BUN,${barcodeHeight},Y,N,Y^FD${upcNorm.substring(0, 11)}^FS\n`;
+        } else if (isEan13) {
+          zpl += `^FO${barcodeX},${barcodeY}^BEN,${barcodeHeight},Y,N^FD${upcNorm}^FS\n`;
         } else {
           zpl += `^FO${barcodeX},${barcodeY}^BCN,${barcodeHeight},Y,N,N^FD${upcNorm}^FS\n`;
         }
