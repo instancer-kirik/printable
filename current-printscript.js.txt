@@ -35,6 +35,7 @@
       this.processingBarcode = false;
       this.lastUpcTime = 0;   // epoch ms of last accepted scan — used for time-based dedup
       this.boundUpcField = null; // reference to the currently bound UPC input element
+      this.cachedPrinterDevice = null; // cached after first successful lookup
       this.printQty = 1;  // batch label quantity — shared by manual print and auto-print
 
       // Restore auto-print preference
@@ -820,8 +821,10 @@
       return Array.isArray(body) ? body : body.printer || body.Printer || [];
     }
 
-    // Resolve which printer device to send to: saved preference > ZT231 by name > sole device
+    // Resolve which printer device to send to: saved preference > ZT231 by name > sole device.
+    // Result is cached so every print doesn't pay a full HTTP round-trip to the agent.
     async getSelectedPrinterDevice() {
+      if (this.cachedPrinterDevice) return this.cachedPrinterDevice;
       const printers = await this.listBrowserPrintPrinters();
       if (!printers || printers.length === 0) {
         throw new Error("No printers found by Browser Print");
@@ -830,7 +833,7 @@
       const savedUid = localStorage.getItem("pm-selected-printer-uid");
       if (savedUid) {
         const match = printers.find((p) => p.uid === savedUid);
-        if (match) return match;
+        if (match) { this.cachedPrinterDevice = match; return match; }
         log(`⚠️ Saved printer uid "${savedUid}" not found among current devices`);
       }
 
@@ -839,10 +842,12 @@
       );
       if (zt231) {
         log("🎯 Auto-matched ZT231 printer:", zt231);
+        this.cachedPrinterDevice = zt231;
         return zt231;
       }
 
       if (printers.length === 1) {
+        this.cachedPrinterDevice = printers[0];
         return printers[0];
       }
 
@@ -898,6 +903,7 @@
         btn.addEventListener("click", () => {
           const uid = btn.dataset.uid;
           localStorage.setItem("pm-selected-printer-uid", uid);
+          this.cachedPrinterDevice = null; // invalidate cache so next print re-resolves
           this.updateStatus(`✅ Printer saved: ${btn.textContent}`, "success");
           log(`💾 Selected printer uid: ${uid}`);
           modal.remove();
