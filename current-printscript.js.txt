@@ -1034,10 +1034,13 @@
       const isUpcA  = /^\d{12}$/.test(upcNorm);          // 12-digit UPC-A
       const isEan13 = !isUpcA && /^\d{13}$/.test(upcNorm); // 13-digit EAN-13 (e.g. European 4xxx)
       const barcodeType = isUpcA ? 'UPC-A (^BU)' : isEan13 ? 'EAN-13 (^BE)' : 'Code 128 (^BC)';
-      log(`🔖 Barcode type: ${barcodeType} for UPC="${upc}" → norm="${upcNorm}"`);
-      // UPC-A and EAN-13 both = 113 modules; Code 128C for 12-digit data = 121 modules
+      // EAN-13 and Code 128 are wider than UPC-A — force module width 1 to fit the label.
+      // UPC-A keeps the user-configured width (default 2).
+      if (!isUpcA) barcodeModuleWidth = 1;
+      log(`🔖 Barcode type: ${barcodeType}, moduleWidth=${barcodeModuleWidth} for UPC="${upc}" → norm="${upcNorm}"`);
+      // UPC-A and EAN-13 both = 113 modules; Code 128 wider (varies by data length)
       const TOTAL_MODULES   = (isUpcA || isEan13) ? 113 : 121;
-      // Auto-clamp module width so the barcode never overdraws the label
+      // Safety clamp — auto-reduce if still too wide
       while (barcodeModuleWidth > 1 && barcodeModuleWidth * TOTAL_MODULES > fieldW) barcodeModuleWidth--;
       const estBarcodeWidth = barcodeModuleWidth * TOTAL_MODULES;
 
@@ -1141,7 +1144,8 @@
       const isUpcA  = /^\d{12}$/.test(upcNorm);
       const isEan13 = !isUpcA && /^\d{13}$/.test(upcNorm);
       const barcodeType = isUpcA ? 'UPC-A (^BU)' : isEan13 ? 'EAN-13 (^BE)' : 'Code 128 (^BC)';
-      log(`🔖 Barcode type: ${barcodeType} for UPC="${upc}" → norm="${upcNorm}"`);
+      if (!isUpcA) barcodeModuleWidth = 1;
+      log(`🔖 Barcode type: ${barcodeType}, moduleWidth=${barcodeModuleWidth} for UPC="${upc}" → norm="${upcNorm}"`);
       const TOTAL_MODULES   = (isUpcA || isEan13) ? 113 : 121;
       while (barcodeModuleWidth > 1 && barcodeModuleWidth * TOTAL_MODULES > fieldWc) barcodeModuleWidth--;
       const estBarcodeWidth = barcodeModuleWidth * TOTAL_MODULES;
