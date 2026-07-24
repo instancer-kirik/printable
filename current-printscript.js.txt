@@ -1026,13 +1026,16 @@
       // ZPL ^BY only accepts integers, so we floor to the nearest whole dot.
       const HRI_FONT         = 14;   // small fixed font for HRI — separate from storeFont
       const barcodeHeight    = this.printSettings.barcodeHeightDots  ?? 40;
-      const barcodeModuleWidth = Math.round(this.printSettings.barcodeModuleWidth ?? 2); // ^BY only accepts integers
+      let barcodeModuleWidth = Math.round(this.printSettings.barcodeModuleWidth ?? 2); // ^BY only accepts integers
       // UPC-A (12 digits): 95 symbol + 18 quiet zone = 113 modules
       // Code 128C fallback: 101 symbol + 20 quiet zone = 121 modules
       // A 13-digit UPC starting with 0 is an EAN-13 encoding of a UPC-A — strip the leading 0.
       const upcNorm = /^0\d{12}$/.test(upc) ? upc.substring(1) : upc;
       const isUpcA = /^\d{12}$/.test(upcNorm);
+      log(`🔖 Barcode type: ${isUpcA ? 'UPC-A (^BU)' : 'Code 128 (^BC)'} for UPC="${upc}" → norm="${upcNorm}"`);
       const TOTAL_MODULES   = isUpcA ? 113 : 121;
+      // Auto-clamp module width so the barcode never overdraws the label
+      while (barcodeModuleWidth > 1 && barcodeModuleWidth * TOTAL_MODULES > fieldW) barcodeModuleWidth--;
       const estBarcodeWidth = barcodeModuleWidth * TOTAL_MODULES;
 
       // --- Y layout: name block at top, price+barcode anchored from bottom ---
@@ -1127,11 +1130,14 @@
 
       const HRI_FONT         = 14;
       const barcodeHeight    = parseInt(settings.barcodeHeightDots ?? this.printSettings.barcodeHeightDots ?? 40, 10);
-      const barcodeModuleWidth = Math.round(parseFloat(settings.barcodeModuleWidth ?? this.printSettings.barcodeModuleWidth ?? 2));
+      let barcodeModuleWidth = Math.round(parseFloat(settings.barcodeModuleWidth ?? this.printSettings.barcodeModuleWidth ?? 2));
       // A 13-digit UPC starting with 0 is an EAN-13 encoding of a UPC-A — strip the leading 0.
       const upcNorm = /^0\d{12}$/.test(upc) ? upc.substring(1) : upc;
       const isUpcA = /^\d{12}$/.test(upcNorm);
+      log(`🔖 Barcode type: ${isUpcA ? 'UPC-A (^BU)' : 'Code 128 (^BC)'} for UPC="${upc}" → norm="${upcNorm}"`);
       const TOTAL_MODULES   = isUpcA ? 113 : 121;
+      // Auto-clamp module width so the barcode never overdraws the label
+      while (barcodeModuleWidth > 1 && barcodeModuleWidth * TOTAL_MODULES > fieldWc) barcodeModuleWidth--;
       const estBarcodeWidth = barcodeModuleWidth * TOTAL_MODULES;
 
       const topMargin  = 15;
